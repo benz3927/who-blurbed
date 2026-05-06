@@ -36,7 +36,7 @@ Return ONLY valid JSON (no other text, no markdown code blocks) with this struct
   ]
 }}
 
-Include only real, verified blurbers with web evidence. If you cannot find any, return blurbers as an empty list."""
+Include only real, verified blurbers with web evidence. The blurber should be a specific named individual (not an organization or publication). If you cannot find any, return blurbers as an empty list."""
 
     response = client.messages.create(
         model=MODEL,
@@ -49,12 +49,19 @@ Include only real, verified blurbers with web evidence. If you cannot find any, 
 
 
 def find_other_endorsements(blurber_name, exclude_book):
-    """For a given person, find other books they have endorsed."""
-    prompt = f"""Search the web to find books that {blurber_name} has written endorsements/blurbs for.
+    """For a given person, find candidate books they have endorsed."""
+    prompt = f"""Search the web to find books that {blurber_name} has personally written endorsements/blurbs for.
 
 Exclude this book: "{exclude_book}".
 
-Focus on books from the last 10 years where there is verifiable web evidence the person provided an endorsement (their name appears on the back cover, in "Praise for" sections, in publisher marketing, etc.).
+CRITICAL DISAMBIGUATION:
+- Only include books where {blurber_name} (the specific individual person) wrote a personal endorsement
+- Do NOT include books simply because the person works at a related company or publication
+- Do NOT include books published BY a company associated with this person
+- Do NOT include books reviewed by their employer's publication
+- The endorsement must be a personal blurb attributed to this individual by name
+
+Focus on books from the last 10 years where there is verifiable web evidence.
 
 Return ONLY valid JSON (no other text, no markdown code blocks):
 {{
@@ -64,11 +71,49 @@ Return ONLY valid JSON (no other text, no markdown code blocks):
   ]
 }}
 
-Only include books where you have web evidence the person actually endorsed them. Do not include books they merely wrote, mentioned, or recommended in interviews. If you can't find any verified endorsements, return books as an empty list."""
+If you can't find verified personal endorsements, return books as an empty list."""
 
     response = client.messages.create(
         model=MODEL,
         max_tokens=2000,
+        tools=[{"type": "web_search_20250305", "name": "web_search"}],
+        messages=[{"role": "user", "content": prompt}],
+    )
+    text = "".join(b.text for b in response.content if hasattr(b, "text"))
+    return _extract_json(text)
+
+
+def verify_endorsement(blurber_name, book_title, book_author):
+    """Double-check whether a person actually endorsed a specific book.
+    
+    Returns dict with keys: verified (bool), evidence_url (str), quote (str), reason (str).
+    """
+    prompt = f"""I need to verify whether {blurber_name} (the specific individual) personally wrote a blurb or endorsement for this book:
+
+Book: "{book_title}" by {book_author}
+
+Search the web carefully. Look for direct evidence such as:
+- The blurb appearing on the book's back cover, Amazon page, or publisher's website
+- The exact quote attributed by name to {blurber_name}
+- News coverage or interviews confirming the endorsement
+
+CRITICAL — REJECT these false positives:
+- The book is published by a company associated with {blurber_name} (e.g., Bloomberg published it, but Michael Bloomberg the person didn't blurb it)
+- The book's author works for a company associated with {blurber_name} (e.g., the author works at Bloomberg News, so the LLM assumed Michael Bloomberg endorsed it)
+- A publication associated with {blurber_name} reviewed it (a Bloomberg News review is not a Michael Bloomberg endorsement)
+- {blurber_name} merely mentioned the book in passing or recommended it in an interview (we want formal blurbs only)
+
+Return ONLY valid JSON:
+{{
+  "verified": true or false,
+  "evidence_url": "URL where you found the blurb, or empty string",
+  "quote": "the exact blurb text if you found it, or empty string",
+  "reason": "brief explanation of decision"
+}}"""
+
+    response = client.messages.create(
+        model=MODEL,
+        max_tokens=1000,
         tools=[{"type": "web_search_20250305", "name": "web_search"}],
         messages=[{"role": "user", "content": prompt}],
     )
@@ -98,12 +143,13 @@ def recommend_books(book_title, book_author):
     print(f"who-blurbed: '{book_title}' by {book_author}")
     print(f"{'=' * 60}")
 
-    print(f"\n[1/3] Finding blurbers...")
+    # Step 1: find blurbers on input book
+    print(f"\n[1/4] Finding blurbers...")
     blurber_data = find_blurbers(book_title, book_author)
     blurbers = blurber_data.get("blurbers", [])
 
     if not blurbers:
-        print("  No blurbers found. Try a different book or check the title spelling.")
+        print("  No blurbers found.")
         return
 
     print(f"  Found {len(blurbers)} blurber(s):")
@@ -112,8 +158,9 @@ def recommend_books(book_title, book_author):
         aff = b.get("affiliation", "")
         print(f"    - {name}" + (f" ({aff})" if aff else ""))
 
-    print(f"\n[2/3] Searching for each blurber's other endorsements...")
-    book_to_endorsers = {}
+    # Step 2: find candidate books each blurber has endorsed
+    print(f"\n[2/4] Searching for each blurber's other endorsements...")
+    candidates = []  # list of (blurber_name, book_dict)
 
     for b in blurbers:
         name = b.get("name")
@@ -122,26 +169,54 @@ def recommend_books(book_title, book_author):
         print(f"  Searching: {name}")
         result = find_other_endorsements(name, book_title)
         for book in result.get("books", []):
-            title = book.get("title", "").strip()
-            if not title:
-                continue
-            if title not in book_to_endorsers:
-                book_to_endorsers[title] = {
-                    "title": title,
-                    "author": book.get("author", "unknown"),
-                    "year": book.get("year"),
-                    "one_line": book.get("one_line", ""),
-                    "endorsers": [],
-                }
-            if name not in book_to_endorsers[title]["endorsers"]:
-                book_to_endorsers[title]["endorsers"].append(name)
+            if book.get("title", "").strip():
+                candidates.append((name, book))
 
-    print(f"\n[3/3] Ranked recommendations:")
+    print(f"  Found {len(candidates)} candidate endorsement(s) to verify")
+
+    # Step 3: verify each candidate
+    print(f"\n[3/4] Verifying each candidate endorsement...")
+    verified = []  # list of (blurber_name, book_dict, verification_dict)
+
+    for blurber_name, book in candidates:
+        title = book["title"]
+        author = book.get("author", "unknown")
+        print(f"  Verifying: {blurber_name} -> '{title}'")
+        v = verify_endorsement(blurber_name, title, author)
+        if v.get("verified"):
+            print(f"    ✓ verified")
+            verified.append((blurber_name, book, v))
+        else:
+            reason = v.get("reason", "no reason given")
+            print(f"    ✗ rejected: {reason}")
+
+    # Step 4: aggregate verified endorsements
+    print(f"\n[4/4] Ranked recommendations:")
     print(f"{'-' * 60}")
 
-    if not book_to_endorsers:
-        print("  No cross-referenced books found.")
+    if not verified:
+        print("  No verified cross-referenced books found.")
         return
+
+    book_to_endorsers = {}
+    for blurber_name, book, v in verified:
+        title = book["title"]
+        if title not in book_to_endorsers:
+            book_to_endorsers[title] = {
+                "title": title,
+                "author": book.get("author", "unknown"),
+                "year": book.get("year"),
+                "one_line": book.get("one_line", ""),
+                "endorsers": [],
+                "evidence": [],
+            }
+        if blurber_name not in book_to_endorsers[title]["endorsers"]:
+            book_to_endorsers[title]["endorsers"].append(blurber_name)
+            book_to_endorsers[title]["evidence"].append({
+                "endorser": blurber_name,
+                "url": v.get("evidence_url", ""),
+                "quote": v.get("quote", ""),
+            })
 
     ranked = sorted(
         book_to_endorsers.values(),
@@ -168,14 +243,13 @@ def recommend_books(book_title, book_author):
             f,
             indent=2,
         )
-    print(f"\n  Full output saved to {out_path}")
+    print(f"\n  Full output (with evidence URLs) saved to {out_path}")
 
 
 if __name__ == "__main__":
     if not os.environ.get("ANTHROPIC_API_KEY"):
         print("ERROR: ANTHROPIC_API_KEY not found.")
-        print("Create a .env file in this directory with:")
-        print("  ANTHROPIC_API_KEY=your_key_here")
+        print("Create a .env file with: ANTHROPIC_API_KEY=your_key_here")
         sys.exit(1)
 
     if len(sys.argv) >= 3:
