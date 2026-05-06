@@ -1,17 +1,23 @@
-# who-blurbed
+# next-read
 
-Given a book, find other books endorsed by the same people who blurbed it.
+Find books endorsed by people whose taste you trust.
 
-The premise: book endorsements are a curation signal. If a few people you trust
-all endorsed Book A, the other books they each endorsed are probably worth a look.
+## Two modes
 
-## How it works
+**By Book** — Input a book title and author. We find the blurbers on the back cover, then find every other book those blurbers have endorsed.
 
-1. Input: book title and author
-2. Web search to identify the blurbers on the back cover
-3. For each blurber, search the web for other books they have endorsed
-4. Aggregate and rank by overlapping endorsers (books endorsed by 2+ of the same
-   people surface to the top)
+**By Person** — Input an endorser name (e.g., "Michael Bloomberg"). We find every book that person has blurbed.
+
+## Architecture
+
+Agentic pipeline with four specialized agents:
+
+- **Blurber Finder Agent** — exhaustive multi-search to identify every real human endorser on a book
+- **Endorsement Search Agent** — finds all books a person has blurbed
+- **Verifier Agent** — confirms each claim with direct evidence (URL plus quote)
+- **Ranker Agent** — aggregates and ranks by overlapping endorsers
+
+Search and verification run in parallel for speed.
 
 ## Setup
 
@@ -31,27 +37,32 @@ all endorsed Book A, the other books they each endorsed are probably worth a loo
 
    Then edit `.env` and replace the placeholder with your real Anthropic API key.
 
-4. Run it:
+## Run the web app
 
 ```
-   python blurb_recommender.py
+python app.py
 ```
 
-## Custom input
+Open http://localhost:7860 in your browser.
+
+## Run from the command line
+
+By book:
 
 ```
-python blurb_recommender.py "Book Title" "Author Name"
+python next_read.py "Streetwise: Getting to and Through Goldman Sachs" "Lloyd Blankfein"
+```
+
+By person:
+
+```
+python next_read.py "Michael Bloomberg"
 ```
 
 ## Example
 
-Input: Streetwise: Getting to and Through Goldman Sachs (Lloyd Blankfein)
+Input: Streetwise (Lloyd Blankfein)
 
-Blurbers: Michael Bloomberg, Ken Griffin, Niall Ferguson
+Blurbers found: Warren Buffett, Michael Bloomberg, Jim Cramer, Barry Diller, Niall Ferguson, Ken Griffin, David Rubenstein, Liaquat Ahamed
 
-Output: ranked list of other books endorsed by the same people, with overlapping
-endorsers surfaced first.
-
-## Status
-
-Prototype.
+Output: ranked list of other books endorsed by the same people, with overlapping endorsers surfaced first and a sourced quote and URL stored for each verified endorsement.
