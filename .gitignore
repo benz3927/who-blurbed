@@ -15,11 +15,11 @@ venv/
 env/
 ENV/
 
-# Output files
-recommendations.json
+# Output files / cache (all JSON except known-safe ones)
 *.json
 !package.json
 !package-lock.json
+!.env.example
 
 # IDE
 .idea/
