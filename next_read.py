@@ -8,9 +8,11 @@ Two modes:
 
 Architecture: agentic pipeline with separate Search, Verify, and Rank agents.
 
-Improvements over v3:
-- LLM-based name variant expansion (handles "Mike" / "Michael" automatically)
-- Multi-pass search per blurber (merges results from name variants)
+v3.3:
+- Multi-run merging: each variant search runs twice and results are merged.
+  Combats LLM stochasticity to surface more real endorsements per query.
+- Variant searches now run in parallel.
+- LLM-based name variant expansion (handles Mike/Michael automatically).
 """
 
 import json
@@ -25,6 +27,13 @@ load_dotenv()
 
 client = OpenAI()
 MODEL = "gpt-4.1"
+
+# How many times to run each search query and merge results.
+# Higher = more consistent + more API cost.
+SEARCH_RUNS_PER_VARIANT = 2
+
+# Cap on how many name variants the LLM can return.
+MAX_VARIANTS = 3
 
 
 # ============================================================
@@ -74,7 +83,7 @@ Examples:
 - "William Buffett" -> ["William Buffett", "Bill Buffett"]
 - "Robert Iger" -> ["Robert Iger", "Bob Iger"]
 
-Include only real, commonly-used variants for this same individual. Always include the original input as the first item.
+Include only real, commonly-used variants for this same individual. Always include the original input as the first item. Return AT MOST 3 variants.
 
 Return ONLY valid JSON (no other text, no markdown):
 {{"variants": ["Original Name", "Variant 2", "Variant 3"]}}"""
@@ -98,7 +107,7 @@ Return ONLY valid JSON (no other text, no markdown):
                 if key not in seen:
                     seen.add(key)
                     deduped.append(v)
-            return deduped
+            return deduped[:MAX_VARIANTS]
         return [full_name]
     except Exception as e:
         print(f"  [warning] name_variants failed: {e}")
@@ -209,27 +218,44 @@ Try hard to find at least 3-5 if the person is a known endorser."""
 
 
 def endorsement_search_agent(blurber_name, exclude_book=None):
-    """Multi-pass endorsement search across name variants. Returns merged candidates."""
+    """Multi-pass endorsement search across name variants AND multiple runs per variant.
+    
+    Runs each variant SEARCH_RUNS_PER_VARIANT times in parallel, merges all results
+    by lowercase title to combat LLM stochasticity.
+    """
     variants = name_variants(blurber_name)
+    
+    # Build a list of all (variant, run_index) pairs to execute in parallel
+    tasks = []
+    for v in variants:
+        for run_idx in range(SEARCH_RUNS_PER_VARIANT):
+            tasks.append((v, run_idx))
     
     all_books = {}
     
-    for variant in variants:
-        try:
-            result = _endorsement_search_single(variant, exclude_book)
-            for book in result.get("books", []):
-                title = book.get("title", "").strip()
-                if not title:
-                    continue
-                key = title.lower()
-                if key not in all_books:
-                    all_books[key] = book
-        except Exception as e:
-            print(f"  [warning] search failed for variant '{variant}': {e}")
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        future_to_task = {
+            executor.submit(_endorsement_search_single, variant, exclude_book): (variant, run_idx)
+            for variant, run_idx in tasks
+        }
+        for future in as_completed(future_to_task):
+            variant, run_idx = future_to_task[future]
+            try:
+                result = future.result()
+                for book in result.get("books", []):
+                    title = book.get("title", "").strip()
+                    if not title:
+                        continue
+                    key = title.lower()
+                    if key not in all_books:
+                        all_books[key] = book
+            except Exception as e:
+                print(f"  [warning] search failed for variant '{variant}' run {run_idx}: {e}")
     
     return {
         "endorser": blurber_name,
         "variants_searched": variants,
+        "runs_per_variant": SEARCH_RUNS_PER_VARIANT,
         "books": list(all_books.values()),
     }
 
@@ -328,7 +354,7 @@ def recommend_from_book(book_title, book_author, log=print):
     if not blurbers:
         return {"blurbers": [], "recommendations": []}
 
-    log(f"\n[2/4] Endorsement Search: parallel search across blurbers (with name variants)...")
+    log(f"\n[2/4] Endorsement Search: parallel search across blurbers (with name variants, multi-run)...")
     candidates = []
     with ThreadPoolExecutor(max_workers=4) as executor:
         future_to_name = {
@@ -382,10 +408,11 @@ def recommend_from_book(book_title, book_author, log=print):
 
 def recommend_from_name(person_name, log=print):
     """Mode B: endorser name -> all books they have blurbed."""
-    log(f"\n[1/3] Endorsement Search: finding everything {person_name} has blurbed (with name variants)...")
+    log(f"\n[1/3] Endorsement Search: finding everything {person_name} has blurbed (with variants, multi-run)...")
     result = endorsement_search_agent(person_name, exclude_book=None)
     variants_used = result.get("variants_searched", [person_name])
-    log(f"  Variants searched: {', '.join(variants_used)}")
+    runs = result.get("runs_per_variant", 1)
+    log(f"  Variants searched: {', '.join(variants_used)} (x{runs} runs each)")
     candidates = []
     for book in result.get("books", []):
         if book.get("title", "").strip():
