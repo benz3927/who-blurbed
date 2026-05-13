@@ -2,10 +2,17 @@
 next-read: web app interface
 Run: python app.py
 Then open http://localhost:7860 in your browser.
+
+Auth: set APP_USERNAME and APP_PASSWORD in .env to enable login.
+If either is missing, the app launches without auth.
 """
 
+import os
 import gradio as gr
+from dotenv import load_dotenv
 from next_read import recommend_from_book, recommend_from_name
+
+load_dotenv()
 
 
 def run_book_mode(title, author):
@@ -69,14 +76,14 @@ def _format_output(result):
                 quote = ev["quote"]
                 if len(quote) > 200:
                     quote = quote[:200] + "..."
-                lines.append(f"> \"{quote}\" — {ev['endorser']}")
+                lines.append(f"> \"{quote}\" \u2014 {ev['endorser']}")
         lines.append("")
     
     return "\n".join(lines)
 
 
-with gr.Blocks(title="next-read") as demo:
-    gr.Markdown("# next-read")
+with gr.Blocks(title="NextRead") as demo:
+    gr.Markdown("# NextRead")
     gr.Markdown("Find books endorsed by people whose taste you trust.")
     
     with gr.Tab("By Book"):
@@ -101,4 +108,12 @@ with gr.Blocks(title="next-read") as demo:
 
 
 if __name__ == "__main__":
-    demo.launch(share=True)
+    username = os.environ.get("APP_USERNAME")
+    password = os.environ.get("APP_PASSWORD")
+    
+    if username and password:
+        print(f"Launching with auth (username: {repr(username)}, password length: {len(password)})")
+        demo.launch(auth=(username, password), ssr_mode=False)
+    else:
+        print("Launching without auth (set APP_USERNAME and APP_PASSWORD in .env to enable login)")
+        demo.launch(ssr_mode=False)
