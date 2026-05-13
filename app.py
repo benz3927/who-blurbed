@@ -1,10 +1,5 @@
 """
 next-read: web app interface
-Run: python app.py
-Then open http://localhost:7860 in your browser.
-
-Auth: set APP_USERNAME and APP_PASSWORD in .env to enable login.
-If either is missing, the app launches without auth.
 """
 
 import os
@@ -14,15 +9,29 @@ from next_read import recommend_from_book, recommend_from_name
 
 load_dotenv()
 
+APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
+
+
+def check_password(pw):
+    if pw == APP_PASSWORD and APP_PASSWORD:
+        return (
+            gr.update(visible=False),  # hide login
+            gr.update(visible=True),   # show app
+            "",
+        )
+    return (
+        gr.update(visible=True),
+        gr.update(visible=False),
+        "Wrong password. Try again.",
+    )
+
 
 def run_book_mode(title, author):
     if not title.strip() or not author.strip():
         return "Please enter both a book title and author.", ""
-    
     logs = []
     def logger(msg):
         logs.append(str(msg))
-    
     try:
         result = recommend_from_book(title.strip(), author.strip(), log=logger)
         return _format_output(result), "\n".join(logs)
@@ -33,11 +42,9 @@ def run_book_mode(title, author):
 def run_name_mode(name):
     if not name.strip():
         return "Please enter a person's name.", ""
-    
     logs = []
     def logger(msg):
         logs.append(str(msg))
-    
     try:
         result = recommend_from_name(name.strip(), log=logger)
         return _format_output(result), "\n".join(logs)
@@ -47,7 +54,6 @@ def run_name_mode(name):
 
 def _format_output(result):
     recs = result.get("recommendations", [])
-    
     lines = []
     if result.get("input_book"):
         b = result["input_book"]
@@ -58,11 +64,9 @@ def _format_output(result):
             lines.append(f"**Blurbers found:** {names}\n")
     elif result.get("input_name"):
         lines.append(f"# Books endorsed by {result['input_name']}\n")
-    
     if not recs:
         lines.append("\n_No verified recommendations found. Try a different name or book, or check the process log below for details._")
         return "\n".join(lines)
-    
     for i, rec in enumerate(recs, 1):
         endorsers = ", ".join(rec["endorsers"])
         year = rec.get("year") or "n/a"
@@ -78,42 +82,58 @@ def _format_output(result):
                     quote = quote[:200] + "..."
                 lines.append(f"> \"{quote}\" \u2014 {ev['endorser']}")
         lines.append("")
-    
     return "\n".join(lines)
 
 
 with gr.Blocks(title="NextRead") as demo:
-    gr.Markdown("# NextRead")
-    gr.Markdown("Find books endorsed by people whose taste you trust.")
-    
-    with gr.Tab("By Book"):
-        gr.Markdown("Enter a book. We find the blurbers on the back cover, then find what those people endorsed elsewhere. (Takes 1-2 minutes.)")
-        with gr.Row():
-            book_title = gr.Textbox(label="Book Title", placeholder="e.g. Streetwise: Getting to and Through Goldman Sachs")
-            book_author = gr.Textbox(label="Author", placeholder="e.g. Lloyd Blankfein")
-        book_btn = gr.Button("Find Recommendations", variant="primary")
-        book_output = gr.Markdown()
-        with gr.Accordion("Process log", open=False):
-            book_log = gr.Textbox(label="", lines=15)
-        book_btn.click(run_book_mode, inputs=[book_title, book_author], outputs=[book_output, book_log])
-    
-    with gr.Tab("By Person"):
-        gr.Markdown("Enter the name of an endorser. We find every book they've blurbed. (Takes 30-60 seconds.)")
-        person_name = gr.Textbox(label="Endorser Name", placeholder="e.g. Michael Bloomberg")
-        name_btn = gr.Button("Find Endorsements", variant="primary")
-        name_output = gr.Markdown()
-        with gr.Accordion("Process log", open=False):
-            name_log = gr.Textbox(label="", lines=15)
-        name_btn.click(run_name_mode, inputs=[person_name], outputs=[name_output, name_log])
+    # Login section
+    with gr.Column(visible=True) as login_section:
+        gr.Markdown("# NextRead")
+        gr.Markdown("Please enter the password to access this app.")
+        pw_input = gr.Textbox(label="Password", type="password")
+        pw_btn = gr.Button("Enter", variant="primary")
+        pw_error = gr.Markdown("")
+
+    # Main app section (hidden until password correct)
+    with gr.Column(visible=False) as app_section:
+        gr.Markdown("# NextRead")
+        gr.Markdown("Find books endorsed by people whose taste you trust.")
+
+        with gr.Tab("By Book"):
+            gr.Markdown("Enter a book. We find the blurbers on the back cover, then find what those people endorsed elsewhere. (Takes 1-2 minutes.)")
+            with gr.Row():
+                book_title = gr.Textbox(label="Book Title", placeholder="e.g. Streetwise: Getting to and Through Goldman Sachs")
+                book_author = gr.Textbox(label="Author", placeholder="e.g. Lloyd Blankfein")
+            book_btn = gr.Button("Find Recommendations", variant="primary")
+            book_output = gr.Markdown()
+            with gr.Accordion("Process log", open=False):
+                book_log = gr.Textbox(label="", lines=15)
+            book_btn.click(run_book_mode, inputs=[book_title, book_author], outputs=[book_output, book_log])
+
+        with gr.Tab("By Person"):
+            gr.Markdown("Enter the name of an endorser. We find every book they've blurbed. (Takes 30-60 seconds.)")
+            person_name = gr.Textbox(label="Endorser Name", placeholder="e.g. Michael Bloomberg")
+            name_btn = gr.Button("Find Endorsements", variant="primary")
+            name_output = gr.Markdown()
+            with gr.Accordion("Process log", open=False):
+                name_log = gr.Textbox(label="", lines=15)
+            name_btn.click(run_name_mode, inputs=[person_name], outputs=[name_output, name_log])
+
+    pw_btn.click(
+        check_password,
+        inputs=[pw_input],
+        outputs=[login_section, app_section, pw_error],
+    )
+    pw_input.submit(
+        check_password,
+        inputs=[pw_input],
+        outputs=[login_section, app_section, pw_error],
+    )
 
 
 if __name__ == "__main__":
-    username = os.environ.get("APP_USERNAME")
-    password = os.environ.get("APP_PASSWORD")
-    
-    if username and password:
-        print(f"Launching with auth (username: {repr(username)}, password length: {len(password)})")
-        demo.launch(auth=(username, password), ssr_mode=False)
+    if not APP_PASSWORD:
+        print("WARNING: APP_PASSWORD not set. App is unprotected.")
     else:
-        print("Launching without auth (set APP_USERNAME and APP_PASSWORD in .env to enable login)")
-        demo.launch(ssr_mode=False)
+        print(f"App protected. Password length: {len(APP_PASSWORD)}")
+    demo.launch(ssr_mode=False)
