@@ -1,9 +1,12 @@
 """
 next-read: blurb-based book recommender (OpenAI version)
 
-v3.4:
+v3.6:
 - File-based result caching for consistency, speed, and cost.
-  Once a query is answered, repeated calls hit the cache instead of the API.
+- Majority-vote verifier: each (blurber, book) pair is verified N times,
+  and accepted only if >= threshold runs agree. Cached after voting.
+- Configurable via VERIFIER_RUNS and VERIFIER_THRESHOLD.
+- Robust JSON extraction that handles curly quotes and other LLM quirks.
 """
 
 import json
@@ -22,6 +25,11 @@ MODEL = "gpt-4.1"
 
 SEARCH_RUNS_PER_VARIANT = 2
 MAX_VARIANTS = 3
+
+# Majority-vote verifier settings.
+# Set VERIFIER_RUNS=1 to disable voting (single run, cheaper).
+VERIFIER_RUNS = 3
+VERIFIER_THRESHOLD = 2  # need >= this many "verified" votes to accept
 
 CACHE_FILE = "cache.json"
 _cache = None  # lazy-loaded
@@ -123,7 +131,7 @@ Examples:
 
 Always include the original input first. Return AT MOST 3 variants.
 
-Return ONLY valid JSON (no other text, no markdown):
+Return ONLY valid JSON (no other text, no markdown). Use STRAIGHT ASCII quotes only inside JSON strings; never use curly/typographic quotes:
 {{"variants": ["Original Name", "Variant 2", "Variant 3"]}}"""
 
     try:
@@ -191,7 +199,8 @@ EXCLUDE:
 - Publisher's own marketing copy
 - The book's own author or co-authors
 
-Return ONLY valid JSON (no other text, no markdown, no trailing commas):
+Return ONLY valid JSON (no other text, no markdown, no trailing commas).
+IMPORTANT: Use STRAIGHT ASCII quotes (") only as JSON delimiters and inside string values. Never use curly typographic quotes ("/" or '/'). If you need to quote text inside a string, paraphrase or escape with backslash:
 {{
   "book_title": "...",
   "book_author": "...",
@@ -217,9 +226,9 @@ def _endorsement_search_single(blurber_name, exclude_book=None):
     
     prompt = f"""You are the ENDORSEMENT SEARCH agent for the next-read app.
 
-Find books that {blurber_name} (the specific individual person) has personally endorsed for SOMEONE ELSE'S book — meaning {blurber_name} wrote a blurb, foreword, or introduction for a book authored by another person.{exclude_clause}
+Find books that {blurber_name} (the specific individual person) has personally endorsed for SOMEONE ELSE'S book \u2014 meaning {blurber_name} wrote a blurb, foreword, or introduction for a book authored by another person.{exclude_clause}
 
-CRITICAL — DO NOT INCLUDE:
+CRITICAL \u2014 DO NOT INCLUDE:
 - Books AUTHORED or CO-AUTHORED by {blurber_name}
 - Books where {blurber_name} is the subject (biography, memoir target, quote collection)
 - Books titled with {blurber_name}'s name
@@ -243,11 +252,12 @@ Search strategy:
 
 Look across the last 15 years.
 
-Return ONLY valid JSON (no other text, no markdown, no trailing commas):
+Return ONLY valid JSON (no other text, no markdown, no trailing commas).
+IMPORTANT: Use STRAIGHT ASCII quotes (") only as JSON delimiters and inside string values. Never use curly typographic quotes ("/" or '/'). If a blurb you want to include contains quotes, paraphrase it or remove the inner quotes:
 {{
   "endorser": "{blurber_name}",
   "books": [
-    {{"title": "Book Title", "author": "Author Name (must NOT be {blurber_name})", "year": 2023, "one_line": "brief description"}}
+    {{"title": "Book Title", "author": "Author Name (must NOT be {blurber_name})", "year": 2023, "one_line": "brief description without inner quotes"}}
   ]
 }}"""
     text = _call_with_search(prompt)
@@ -300,14 +310,11 @@ def endorsement_search_agent(blurber_name, exclude_book=None):
 
 
 # ============================================================
-# AGENT 3: VERIFIER (cached)
+# AGENT 3: VERIFIER (majority-vote, cached)
 # ============================================================
 
-def verifier_agent(blurber_name, book_title, book_author):
-    cached = _cache_get("verifier", blurber_name, book_title, book_author)
-    if cached is not None:
-        return cached
-    
+def _verifier_single(blurber_name, book_title, book_author):
+    """One verifier call. No caching here \u2014 caching happens at the voting layer."""
     prompt = f"""You are the VERIFIER agent for the next-read app.
 
 Confirm whether {blurber_name} (the specific individual person) personally endorsed this book, which should be AUTHORED BY SOMEONE ELSE:
@@ -337,7 +344,8 @@ REJECT (verified=false):
 - A publication associated with the person reviewed it
 - Person merely mentioned the book in passing
 
-Return ONLY valid JSON (no other text, no markdown, no trailing commas):
+Return ONLY valid JSON (no other text, no markdown, no trailing commas).
+IMPORTANT: Use STRAIGHT ASCII quotes (") only as JSON delimiters and inside string values. Never use curly typographic quotes ("/" or '/'). If the blurb text you want to include contains quotes, paraphrase or remove the inner quotes:
 {{
   "verified": true,
   "evidence_url": "URL where you found the blurb, or empty",
@@ -345,10 +353,71 @@ Return ONLY valid JSON (no other text, no markdown, no trailing commas):
   "reason": "brief explanation"
 }}"""
     text = _call_with_search(prompt, max_output_tokens=1500)
-    result = _extract_json(text)
-    if result:
-        _cache_set("verifier", result, blurber_name, book_title, book_author)
-    return result
+    return _extract_json(text)
+
+
+def verifier_agent(blurber_name, book_title, book_author):
+    """
+    Majority-vote verifier. Runs _verifier_single up to VERIFIER_RUNS times in parallel,
+    accepts only if >= VERIFIER_THRESHOLD runs return verified=true.
+    Caches the final aggregated result.
+    """
+    cached = _cache_get("verifier", blurber_name, book_title, book_author)
+    if cached is not None:
+        return cached
+    
+    # Fast path: if voting is disabled, behave like the old single-run verifier.
+    if VERIFIER_RUNS <= 1:
+        result = _verifier_single(blurber_name, book_title, book_author)
+        if result:
+            _cache_set("verifier", result, blurber_name, book_title, book_author)
+        return result
+    
+    results = []
+    with ThreadPoolExecutor(max_workers=VERIFIER_RUNS) as executor:
+        futures = [
+            executor.submit(_verifier_single, blurber_name, book_title, book_author)
+            for _ in range(VERIFIER_RUNS)
+        ]
+        for f in as_completed(futures):
+            try:
+                results.append(f.result())
+            except Exception as e:
+                print(f"  [warning] verifier run failed: {e}")
+                results.append({})
+    
+    votes_yes = sum(1 for r in results if r.get("verified") is True)
+    votes_no = sum(1 for r in results if r.get("verified") is False)
+    verified = votes_yes >= VERIFIER_THRESHOLD
+    
+    # Pick the best evidence: prefer a "verified" run with a real URL + quote.
+    best = None
+    if verified:
+        candidates = [r for r in results if r.get("verified")]
+        # rank: has URL AND quote > has URL > has quote > anything else
+        candidates.sort(
+            key=lambda r: (
+                bool(r.get("evidence_url")) and bool(r.get("quote")),
+                bool(r.get("evidence_url")),
+                bool(r.get("quote")),
+            ),
+            reverse=True,
+        )
+        best = candidates[0] if candidates else {}
+    else:
+        # If rejected, surface the most informative reason.
+        rejections = [r for r in results if r.get("verified") is False and r.get("reason")]
+        best = rejections[0] if rejections else (results[0] if results else {})
+    
+    final = {
+        "verified": verified,
+        "evidence_url": best.get("evidence_url", "") if best else "",
+        "quote": best.get("quote", "") if best else "",
+        "reason": best.get("reason", "") if best else "",
+        "votes": f"{votes_yes}/{VERIFIER_RUNS} verified, {votes_no}/{VERIFIER_RUNS} rejected",
+    }
+    _cache_set("verifier", final, blurber_name, book_title, book_author)
+    return final
 
 
 # ============================================================
@@ -374,6 +443,7 @@ def ranker_agent(verified_endorsements):
                 "endorser": blurber_name,
                 "url": v.get("evidence_url", ""),
                 "quote": v.get("quote", ""),
+                "votes": v.get("votes", ""),
             })
     return sorted(
         book_to_endorsers.values(),
@@ -418,7 +488,7 @@ def recommend_from_book(book_title, book_author, log=print):
 
     log(f"  Total candidates: {len(candidates)}")
 
-    log(f"\n[3/4] Verifier...")
+    log(f"\n[3/4] Verifier (majority vote: {VERIFIER_THRESHOLD}/{VERIFIER_RUNS})...")
     verified = []
     with ThreadPoolExecutor(max_workers=4) as executor:
         future_to_pair = {
@@ -429,11 +499,12 @@ def recommend_from_book(book_title, book_author, log=print):
             name, book = future_to_pair[future]
             try:
                 v = future.result()
+                votes = v.get("votes", "")
                 if v.get("verified"):
-                    log(f"  + {name} -> '{book['title']}'")
+                    log(f"  + {name} -> '{book['title']}' [{votes}]")
                     verified.append((name, book, v))
                 else:
-                    log(f"  - {name} -> '{book['title']}' ({v.get('reason', '')[:60]})")
+                    log(f"  - {name} -> '{book['title']}' [{votes}] ({v.get('reason', '')[:60]})")
             except Exception as e:
                 log(f"  error verifying {name}: {e}")
 
@@ -459,7 +530,7 @@ def recommend_from_name(person_name, log=print):
             candidates.append((person_name, book))
     log(f"  Found {len(candidates)} candidate(s)")
 
-    log(f"\n[2/3] Verifier...")
+    log(f"\n[2/3] Verifier (majority vote: {VERIFIER_THRESHOLD}/{VERIFIER_RUNS})...")
     verified = []
     with ThreadPoolExecutor(max_workers=4) as executor:
         future_to_book = {
@@ -470,11 +541,12 @@ def recommend_from_name(person_name, log=print):
             book = future_to_book[future]
             try:
                 v = future.result()
+                votes = v.get("votes", "")
                 if v.get("verified"):
-                    log(f"  + '{book['title']}'")
+                    log(f"  + '{book['title']}' [{votes}]")
                     verified.append((person_name, book, v))
                 else:
-                    log(f"  - '{book['title']}' ({v.get('reason', '')[:60]})")
+                    log(f"  - '{book['title']}' [{votes}] ({v.get('reason', '')[:60]})")
             except Exception as e:
                 log(f"  error: {e}")
 
@@ -491,10 +563,27 @@ def recommend_from_name(person_name, log=print):
 # UTILS
 # ============================================================
 
+def _normalize_quotes(s):
+    """Normalize curly typographic quotes to safe straight equivalents.
+    LLMs often emit curly quotes like 'He said "gripping" about it', which
+    breaks JSON parsing because the inner curly quotes look like string
+    delimiters to a naive parser after replacement. We escape them.
+    """
+    # Curly double quotes -> escaped straight double quotes
+    s = s.replace("\u201c", "\\\"").replace("\u201d", "\\\"")
+    # Other double-quote-like characters
+    s = s.replace("\u201f", "\\\"").replace("\u201e", "\\\"")
+    # Curly single quotes -> straight apostrophe
+    s = s.replace("\u2018", "'").replace("\u2019", "'")
+    s = s.replace("\u201a", "'").replace("\u201b", "'")
+    return s
+
+
 def _extract_json(text):
     if not text:
         return {}
     
+    # Strip markdown code fences
     if "```json" in text:
         text = text.split("```json")[1].split("```")[0]
     elif "```" in text:
@@ -507,29 +596,42 @@ def _extract_json(text):
     
     candidate = text[start:end + 1]
     
+    # Attempt 1: parse as-is
     try:
         return json.loads(candidate)
     except json.JSONDecodeError:
         pass
     
-    cleaned = candidate
-    cleaned = re.sub(r',\s*([}\]])', r'\1', cleaned)
+    # Attempt 2: strip trailing commas + control chars
+    cleaned = re.sub(r',\s*([}\]])', r'\1', candidate)
     cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', ' ', cleaned)
-    
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
         pass
     
+    # Attempt 3: normalize curly quotes (most common LLM JSON failure)
+    requoted = _normalize_quotes(cleaned)
+    try:
+        return json.loads(requoted)
+    except json.JSONDecodeError:
+        pass
+    
+    # Attempt 4: progressively shorter substrings, each tried both raw and requoted
     for end_pos in range(end, start, -1):
         sub = text[start:end_pos + 1]
-        if sub.endswith("}"):
-            try:
-                return json.loads(sub)
-            except json.JSONDecodeError:
-                continue
+        if not sub.endswith("}"):
+            continue
+        try:
+            return json.loads(sub)
+        except json.JSONDecodeError:
+            pass
+        try:
+            return json.loads(_normalize_quotes(sub))
+        except json.JSONDecodeError:
+            continue
     
-    print(f"  [warning] failed to parse JSON; first 200 chars: {text[:200]}")
+    print(f"  [warning] failed to parse JSON; first 500 chars: {text[:500]}")
     return {}
 
 
