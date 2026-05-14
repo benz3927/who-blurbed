@@ -3,6 +3,8 @@ next-read: web app interface
 """
 
 import os
+from urllib.parse import quote_plus
+import requests
 import gradio as gr
 from dotenv import load_dotenv
 from next_read import recommend_from_book, recommend_from_name
@@ -12,11 +14,21 @@ load_dotenv()
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 
 
+def _normalize_name(name: str) -> str:
+    """Collapse whitespace and title-case so 'michael  bloomberg' -> 'Michael Bloomberg'."""
+    return " ".join(name.strip().split()).title()
+
+
+def _normalize_title(text: str) -> str:
+    """Just collapse whitespace; preserve user's casing for titles."""
+    return " ".join(text.strip().split())
+
+
 def check_password(pw):
     if pw == APP_PASSWORD and APP_PASSWORD:
         return (
-            gr.update(visible=False),  # hide login
-            gr.update(visible=True),   # show app
+            gr.update(visible=False),
+            gr.update(visible=True),
             "",
         )
     return (
@@ -27,29 +39,65 @@ def check_password(pw):
 
 
 def run_book_mode(title, author):
-    if not title.strip() or not author.strip():
+    title = _normalize_title(title)
+    author = _normalize_name(author)
+    if not title or not author:
         return "Please enter both a book title and author.", ""
     logs = []
     def logger(msg):
         logs.append(str(msg))
     try:
-        result = recommend_from_book(title.strip(), author.strip(), log=logger)
+        result = recommend_from_book(title, author, log=logger)
         return _format_output(result), "\n".join(logs)
     except Exception as e:
         return f"Error: {e}", "\n".join(logs)
 
 
 def run_name_mode(name):
-    if not name.strip():
+    name = _normalize_name(name)
+    if not name:
         return "Please enter a person's name.", ""
     logs = []
     def logger(msg):
         logs.append(str(msg))
     try:
-        result = recommend_from_name(name.strip(), log=logger)
+        result = recommend_from_name(name, log=logger)
         return _format_output(result), "\n".join(logs)
     except Exception as e:
         return f"Error: {e}", "\n".join(logs)
+
+
+def _get_isbn(title, author):
+    """Look up ISBN for a book via Google Books API. Returns None if not found."""
+    try:
+        q = f'intitle:"{title}" inauthor:"{author}"'
+        r = requests.get(
+            "https://www.googleapis.com/books/v1/volumes",
+            params={"q": q, "maxResults": 1},
+            timeout=5,
+        )
+        r.raise_for_status()
+        items = r.json().get("items", [])
+        if not items:
+            return None
+        ids = items[0].get("volumeInfo", {}).get("industryIdentifiers", [])
+        for ident in ids:
+            if ident.get("type") == "ISBN_10":
+                return ident.get("identifier")
+        for ident in ids:
+            if ident.get("type") == "ISBN_13":
+                return ident.get("identifier")
+        return None
+    except Exception:
+        return None
+
+
+def _amazon_link(title, author):
+    isbn = _get_isbn(title, author)
+    if isbn:
+        return f"https://www.amazon.com/dp/{isbn}"
+    query = quote_plus(f"{title} {author}")
+    return f"https://www.amazon.com/s?k={query}&i=stripbooks"
 
 
 def _format_output(result):
@@ -70,8 +118,15 @@ def _format_output(result):
     for i, rec in enumerate(recs, 1):
         endorsers = ", ".join(rec["endorsers"])
         year = rec.get("year") or "n/a"
+        amazon_url = _amazon_link(rec["title"], rec["author"])
         lines.append(f"### {i}. *{rec['title']}* ({year})")
-        lines.append(f"by {rec['author']}")
+        # HTML anchor for the Amazon link (Gradio markdown was mangling
+        # plain-markdown links inside this line). target=_blank so it opens
+        # in a new tab and doesn't navigate away from the app.
+        lines.append(
+            f"by {rec['author']}  \u00b7  "
+            f"<a href='{amazon_url}' target='_blank' rel='noopener'>Buy on Amazon</a>"
+        )
         lines.append(f"**Endorsed by:** {endorsers}")
         if rec.get("one_line"):
             lines.append(f"_{rec['one_line']}_")
@@ -86,7 +141,6 @@ def _format_output(result):
 
 
 with gr.Blocks(title="NextRead") as demo:
-    # Login section
     with gr.Column(visible=True) as login_section:
         gr.Markdown("# NextRead")
         gr.Markdown("Please enter the password to access this app.")
@@ -94,13 +148,16 @@ with gr.Blocks(title="NextRead") as demo:
         pw_btn = gr.Button("Enter", variant="primary")
         pw_error = gr.Markdown("")
 
-    # Main app section (hidden until password correct)
     with gr.Column(visible=False) as app_section:
         gr.Markdown("# NextRead")
         gr.Markdown("Find books endorsed by people whose taste you trust.")
 
         with gr.Tab("By Book"):
-            gr.Markdown("Enter a book. We find the blurbers on the back cover, then find what those people endorsed elsewhere. (Takes 1-2 minutes.)")
+            gr.Markdown(
+                "Enter a book. We find the blurbers on the back cover, "
+                "then find what those people endorsed elsewhere. "
+                "(First search takes 3-6 minutes; instant after that thanks to caching.)"
+            )
             with gr.Row():
                 book_title = gr.Textbox(label="Book Title", placeholder="e.g. Streetwise: Getting to and Through Goldman Sachs")
                 book_author = gr.Textbox(label="Author", placeholder="e.g. Lloyd Blankfein")
@@ -111,7 +168,10 @@ with gr.Blocks(title="NextRead") as demo:
             book_btn.click(run_book_mode, inputs=[book_title, book_author], outputs=[book_output, book_log])
 
         with gr.Tab("By Person"):
-            gr.Markdown("Enter the name of an endorser. We find every book they've blurbed. (Takes 30-60 seconds.)")
+            gr.Markdown(
+                "Enter the name of an endorser. We find every book they've blurbed. "
+                "(First search takes 2-4 minutes; instant after that thanks to caching.)"
+            )
             person_name = gr.Textbox(label="Endorser Name", placeholder="e.g. Michael Bloomberg")
             name_btn = gr.Button("Find Endorsements", variant="primary")
             name_output = gr.Markdown()
