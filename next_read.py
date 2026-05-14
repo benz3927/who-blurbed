@@ -1,11 +1,14 @@
 """
 next-read: blurb-based book recommender (OpenAI Responses + web_search)
 
-Strategy for handling search non-determinism:
-- Run the endorsement search N times in parallel for fresh queries
-- Merge unique books across runs (each run finds slightly different things)
-- Cache the merged result — every subsequent user gets the same answer
-- Dedup uses author + title-prefix so subtitle variants collapse to one entry
+Architecture:
+- Optional disambiguation step (handles common names like Ken Griffin)
+- Run the endorsement search N times in parallel
+- Merge unique books across runs
+- Verifier catches false positives (wrong person, author confusion) — but
+  defaults to ACCEPT candidates the search agent surfaced, instead of
+  requiring independent re-proof of every blurb
+- Cache everything on disk for instant repeat queries
 """
 
 import json
@@ -22,7 +25,7 @@ load_dotenv()
 client = OpenAI()
 MODEL = "gpt-4.1"
 
-RUNS_PER_VARIANT = 3
+RUNS_PER_VARIANT = 5
 
 CACHE_FILE = "cache.json"
 _cache = None
@@ -76,34 +79,21 @@ def _cache_set(prefix, value, *args):
 # ============================================================
 
 def _book_dedup_key(book):
-    """Stable key that collapses subtitle/punctuation/year variants of the same book.
-    
-    e.g. these three become one entry:
-      ("The Fund", "Rob Copeland", 2024)
-      ("The Fund: Ray Dalio, Bridgewater Associates...", "Rob Copeland", 2023)
-      ("the fund.", "rob copeland", None)
-    """
     title = (book.get("title") or "").lower().strip()
-    # Drop after subtitle separator
     title = title.split(":")[0].split(" - ")[0].split(" — ")[0]
-    # Strip punctuation, collapse whitespace
     title = re.sub(r"[^a-z0-9 ]+", "", title)
     title = re.sub(r"\s+", " ", title).strip()
-    # First ~30 chars is plenty unique without being brittle
     title = title[:30]
 
     author = (book.get("author") or "").lower().strip()
     author = re.sub(r"[^a-z0-9 ]+", "", author)
     author = re.sub(r"\s+", " ", author).strip()
-    # First author surname when "X and Y" or "X, Y" co-authors
     author = author.split(" and ")[0].split(",")[0].strip()
 
     return f"{author}|{title}"
 
 
 def _merge_book_into(books_dict, book):
-    """Add `book` to `books_dict` keyed by dedup key.
-    If a duplicate exists, keep the version with the longer/more detailed title."""
     key = _book_dedup_key(book)
     if not key.replace("|", "").strip():
         return
@@ -111,9 +101,7 @@ def _merge_book_into(books_dict, book):
     if existing is None:
         books_dict[key] = book
         return
-    # Prefer the entry with the longer (more detailed) title
     if len(book.get("title", "")) > len(existing.get("title", "")):
-        # Preserve fields from existing if new is missing them
         merged = dict(existing)
         merged.update({k: v for k, v in book.items() if v})
         books_dict[key] = merged
@@ -123,7 +111,7 @@ def _merge_book_into(books_dict, book):
 # OpenAI call wrappers
 # ============================================================
 
-def _call_with_search(prompt, max_output_tokens=3000, max_retries=2, temperature=0):
+def _call_with_search(prompt, max_output_tokens=5000, max_retries=2, temperature=0):
     for attempt in range(max_retries + 1):
         try:
             response = client.responses.create(
@@ -149,7 +137,7 @@ def _call_with_search(prompt, max_output_tokens=3000, max_retries=2, temperature
     return ""
 
 
-def _call_plain(prompt, max_output_tokens=400):
+def _call_plain(prompt, max_output_tokens=600):
     try:
         response = client.responses.create(
             model=MODEL,
@@ -161,6 +149,48 @@ def _call_plain(prompt, max_output_tokens=400):
     except Exception as e:
         print(f"  [warning] plain LLM call failed: {e}")
         return ""
+
+
+# ============================================================
+# DISAMBIGUATION
+# ============================================================
+
+def disambiguate_person(person_name):
+    cached = _cache_get("disambig", person_name)
+    if cached is not None:
+        return cached
+
+    prompt = f"""A user wants to find books that {person_name} has personally endorsed (written a blurb for).
+
+If "{person_name}" is a common name shared by multiple notable people, identify them.
+
+Pick the SINGLE person most likely to be a book blurb-writer. Priority order:
+1. Business executives, investors, finance figures (most likely to blurb business books)
+2. Authors, journalists, academics (often blurb books in their field)
+3. Politicians, public intellectuals
+4. Other public figures
+
+Return ONLY valid JSON, no markdown:
+{{
+  "primary": "Full name with brief disambiguator in parens, e.g. 'Ken Griffin (Citadel founder)'",
+  "alternatives": ["Other notable people with this name"],
+  "is_ambiguous": true or false
+}}
+
+If the name refers to only one likely person, set is_ambiguous=false and leave alternatives empty.
+
+Name: {person_name}"""
+
+    text = _call_plain(prompt, max_output_tokens=400)
+    data = _extract_json(text)
+    primary = data.get("primary", person_name)
+    result = {
+        "primary": primary,
+        "alternatives": data.get("alternatives", []),
+        "is_ambiguous": bool(data.get("is_ambiguous")),
+    }
+    _cache_set("disambig", result, person_name)
+    return result
 
 
 # ============================================================
@@ -176,11 +206,13 @@ def name_variants(full_name):
 
 "{full_name}"
 
+The input may include a disambiguator in parens like "Ken Griffin (Citadel founder)". Preserve the disambiguator across variants so searches stay targeted.
+
 Return common variations someone might use to refer to the same individual: formal name, nicknames, common shortenings, middle initial variations, etc.
 
 Examples:
 - "Michael Bloomberg" -> ["Michael Bloomberg", "Mike Bloomberg", "Michael R. Bloomberg"]
-- "William Buffett" -> ["William Buffett", "Bill Buffett"]
+- "Ken Griffin (Citadel founder)" -> ["Ken Griffin (Citadel founder)", "Kenneth Griffin (Citadel founder)", "Kenneth C. Griffin (Citadel founder)"]
 - "Robert Iger" -> ["Robert Iger", "Bob Iger"]
 
 Include only real, commonly-used variants for this same individual. Always include the original input as the first item.
@@ -268,9 +300,11 @@ def _endorsement_search_one_run(blurber_name, exclude_book, run_idx):
     exclude_clause = f'\nAlso exclude this specific book: "{exclude_book}".' if exclude_book else ""
     prompt = f"""You are the ENDORSEMENT SEARCH agent for the next-read app.
 
-Find books that {blurber_name} (the specific individual person) has personally endorsed for SOMEONE ELSE'S book — meaning {blurber_name} wrote a blurb, foreword, or introduction for a book authored by another person.{exclude_clause}
+Find books that {blurber_name} (the specific individual person, including any disambiguator in parens) has personally endorsed for SOMEONE ELSE'S book — meaning they wrote a blurb, foreword, or introduction for a book authored by another person.{exclude_clause}
 
-CRITICAL — DO NOT INCLUDE:
+CRITICAL: if "{blurber_name}" includes a disambiguator in parens (e.g. "(Citadel founder)"), only include endorsements that are clearly from THAT specific person, not other people who share the name.
+
+DO NOT INCLUDE:
 - Books AUTHORED or CO-AUTHORED by {blurber_name}
 - Books where {blurber_name} is the subject
 - Books titled with {blurber_name}'s name
@@ -278,17 +312,18 @@ CRITICAL — DO NOT INCLUDE:
 - Books published by an associated company
 - Reviews by their employer's publication
 - Casual mentions in interviews
+- Books endorsed by a different person with the same name
 
 BE EXHAUSTIVE. Active blurbers have endorsed many books. Do not stop after finding 1-2.
 
-Search strategy (run multiple searches):
+Search strategy:
 1. "praise for [book]" attributed to {blurber_name}
 2. "{blurber_name}" wrote foreword for
 3. "{blurber_name}" wrote introduction for
 4. Books with cover blurb by {blurber_name}
 5. Publisher pages quoting {blurber_name} about another author's book
 6. Search for {blurber_name}'s name on Amazon book pages in their area of expertise
-7. Recent high-profile nonfiction books in topics {blurber_name} covers (look 2023-2025)
+7. Recent high-profile nonfiction books in topics {blurber_name} covers (2023-2025)
 
 WHAT COUNTS AS AN ENDORSEMENT:
 - Back-cover blurbs / praise quotes attributed by name
@@ -309,12 +344,12 @@ Return ONLY valid JSON (no other text, no markdown, no trailing commas):
 }}
 
 Try hard to find at least 3-5 if the person is a known endorser."""
-    text = _call_with_search(prompt, temperature=0.7)
+    text = _call_with_search(prompt, max_output_tokens=5000, temperature=0.7)
     return _extract_json(text)
 
 
 def _endorsement_search_single_variant(blurber_name, exclude_book):
-    cached = _cache_get("endorse_single_v3", blurber_name, exclude_book or "")
+    cached = _cache_get("endorse_single_v5", blurber_name, exclude_book or "")
     if cached is not None:
         return cached
 
@@ -335,12 +370,12 @@ def _endorsement_search_single_variant(blurber_name, exclude_book):
                 print(f"  [warning] one of the parallel runs failed: {e}")
 
     merged = {"endorser": blurber_name, "books": list(all_books.values())}
-    _cache_set("endorse_single_v3", merged, blurber_name, exclude_book or "")
+    _cache_set("endorse_single_v5", merged, blurber_name, exclude_book or "")
     return merged
 
 
 def endorsement_search_agent(blurber_name, exclude_book=None):
-    cached = _cache_get("endorse_merged_v3", blurber_name, exclude_book or "")
+    cached = _cache_get("endorse_merged_v5", blurber_name, exclude_book or "")
     if cached is not None:
         return cached
 
@@ -362,70 +397,83 @@ def endorsement_search_agent(blurber_name, exclude_book=None):
         "variants_searched": variants,
         "books": list(all_books.values()),
     }
-    _cache_set("endorse_merged_v3", final, blurber_name, exclude_book or "")
+    _cache_set("endorse_merged_v5", final, blurber_name, exclude_book or "")
     return final
 
 
 # ============================================================
-# AGENT 3: VERIFIER
+# AGENT 3: VERIFIER (now defaults to ACCEPT)
 # ============================================================
 
 def verifier_agent(blurber_name, book_title, book_author):
-    cached = _cache_get("verify", blurber_name, book_title, book_author)
+    cached = _cache_get("verify_v3", blurber_name, book_title, book_author)
     if cached is not None:
         return cached
 
     prompt = f"""You are the VERIFIER agent for the next-read app.
 
-Confirm whether {blurber_name} (the specific individual person, including any common name variants like nicknames) personally endorsed this book, which should be AUTHORED BY SOMEONE ELSE:
+A previous search step has already found this as a likely book endorsement by {blurber_name}:
 
 Book: "{book_title}" by {book_author}
 
-FIRST CHECK: is {blurber_name} the author or co-author of this book?
-- If YES, set verified=false with reason "{blurber_name} is the author/co-author".
-- If NO, continue.
+Your job is NOT to independently re-prove the endorsement. The previous search step already did that work. Your job is ONLY to catch a few specific kinds of false positives.
 
-Search for direct evidence of an endorsement:
-- The blurb on the back cover, Amazon page, or publisher's site
-- Foreword or introduction written by {blurber_name}
-- Exact quote attributed by name to {blurber_name}
-- Publisher announcements or marketing copy quoting the endorsement
+DEFAULT BEHAVIOR: verified=true.
 
-ACCEPT (verified=true):
-- Back-cover blurbs / praise quotes attributed by name
-- Forewords or introductions written by the person
-- "Praise for" sections quoting the person
-- Publisher marketing pages quoting the endorsement
+Search the web briefly to check for these specific RED FLAGS. Set verified=false ONLY if you find clear evidence of one:
 
-REJECT (verified=false):
-- {blurber_name} is the author or co-author
-- Book is about {blurber_name}
-- Book published by a company associated with the person
-- Book's author works for an associated company without separate personal endorsement
-- A publication associated with the person reviewed it
-- Person merely mentioned the book in passing
+RED FLAG 1: {blurber_name} is the AUTHOR or CO-AUTHOR of this book (not a blurber).
+  -> reason: "Author/co-author, not blurber"
 
-Return ONLY valid JSON (no other text, no markdown, no trailing commas):
+RED FLAG 2: The blurb / endorsement is from a DIFFERENT person with the same name (e.g., the user wants Ken Griffin the Citadel founder, but the blurb is from Ken Griffin the country music singer).
+  -> reason: "Different person with same name"
+
+RED FLAG 3: The book is BY OR ABOUT {blurber_name} (e.g., biographies, memoirs of the person, books with their name in the title that they didn't blurb).
+  -> reason: "Book is by/about the person"
+
+If you can confirm the endorsement is real (back-cover quote, foreword, "praise for" section attributed by name): verified=true. Include the quote and URL.
+
+If you cannot find an explicit blurb but ALSO cannot find any of the red flags above: verified=true. The earlier search step found this, give it the benefit of the doubt. Include whatever quote text or URL you can.
+
+If you DO find a red flag: verified=false with the matching reason.
+
+DO NOT reject a candidate just because:
+- You couldn't independently find the blurb (search results vary)
+- The blurb is from years ago and hard to verify online now
+- You're not 100% certain it's a "formal" blurb vs an informal endorsement
+
+Return ONLY valid JSON (no markdown, no trailing commas):
 {{
   "verified": true,
   "evidence_url": "URL where you found the blurb, or empty",
   "quote": "exact blurb text if found, or empty",
-  "reason": "brief explanation"
+  "reason": "one of the red flag phrases above, or brief confirmation note"
 }}"""
-    text = _call_with_search(prompt, max_output_tokens=1500, temperature=0)
+    text = _call_with_search(prompt, max_output_tokens=2000, temperature=0)
     result = _extract_json(text)
+    # Default to verified=True if the model returned something but didn't
+    # explicitly say verified=false. This matches the "accept by default" policy.
+    if result:
+        verified = result.get("verified")
+        if verified is None:
+            verified = True
+        else:
+            verified = bool(verified)
+    else:
+        # Empty response — be cautious and reject
+        verified = False
     final = {
-        "verified": bool(result.get("verified")),
-        "evidence_url": result.get("evidence_url", ""),
-        "quote": result.get("quote", ""),
-        "reason": result.get("reason", ""),
+        "verified": verified,
+        "evidence_url": result.get("evidence_url", "") if result else "",
+        "quote": result.get("quote", "") if result else "",
+        "reason": result.get("reason", "") if result else "empty verifier response",
     }
-    _cache_set("verify", final, blurber_name, book_title, book_author)
+    _cache_set("verify_v3", final, blurber_name, book_title, book_author)
     return final
 
 
 # ============================================================
-# AGENT 4: RANKER (also uses dedup key for final aggregation)
+# AGENT 4: RANKER
 # ============================================================
 
 def ranker_agent(verified_endorsements):
@@ -441,7 +489,6 @@ def ranker_agent(verified_endorsements):
                 "endorsers": [],
                 "evidence": [],
             }
-        # Keep the longest title we've seen for this key
         if len(book.get("title", "")) > len(by_key[key]["title"]):
             by_key[key]["title"] = book["title"]
         if blurber_name not in by_key[key]["endorsers"]:
@@ -494,7 +541,7 @@ def recommend_from_book(book_title, book_author, log=print):
                 log(f"  {name}: error - {e}")
     log(f"  Total candidates: {len(candidates)}")
 
-    log(f"\n[3/4] Verifier: parallel verification...")
+    log(f"\n[3/4] Verifier: parallel verification (accept by default)...")
     verified = []
     with ThreadPoolExecutor(max_workers=4) as executor:
         future_to_pair = {
@@ -523,21 +570,28 @@ def recommend_from_book(book_title, book_author, log=print):
 
 
 def recommend_from_name(person_name, log=print):
-    log(f"\n[1/3] Endorsement Search ({RUNS_PER_VARIANT} parallel runs per variant)...")
-    result = endorsement_search_agent(person_name, exclude_book=None)
-    variants_used = result.get("variants_searched", [person_name])
+    log(f"\n[1/4] Disambiguating '{person_name}'...")
+    disambig = disambiguate_person(person_name)
+    primary = disambig["primary"]
+    log(f"  Resolved to: {primary}")
+    if disambig.get("alternatives"):
+        log(f"  (Other people with this name: {', '.join(disambig['alternatives'])})")
+
+    log(f"\n[2/4] Endorsement Search ({RUNS_PER_VARIANT} parallel runs per variant)...")
+    result = endorsement_search_agent(primary, exclude_book=None)
+    variants_used = result.get("variants_searched", [primary])
     log(f"  Variants searched: {', '.join(variants_used)}")
     candidates = []
     for book in result.get("books", []):
         if book.get("title", "").strip():
-            candidates.append((person_name, book))
+            candidates.append((primary, book))
     log(f"  Found {len(candidates)} candidate(s)")
 
-    log(f"\n[2/3] Verifier: parallel verification...")
+    log(f"\n[3/4] Verifier: parallel verification (accept by default)...")
     verified = []
     with ThreadPoolExecutor(max_workers=4) as executor:
         future_to_book = {
-            executor.submit(verifier_agent, person_name, book["title"], book.get("author", "")): book
+            executor.submit(verifier_agent, primary, book["title"], book.get("author", "")): book
             for _, book in candidates
         }
         for future in as_completed(future_to_book):
@@ -546,16 +600,18 @@ def recommend_from_name(person_name, log=print):
                 v = future.result()
                 if v.get("verified"):
                     log(f"  + '{book['title']}'")
-                    verified.append((person_name, book, v))
+                    verified.append((primary, book, v))
                 else:
                     log(f"  - '{book['title']}' ({v.get('reason', '')[:60]})")
             except Exception as e:
                 log(f"  error: {e}")
 
-    log(f"\n[3/3] Ranker: {len(verified)} verified...")
+    log(f"\n[4/4] Ranker: {len(verified)} verified...")
     recommendations = ranker_agent(verified)
     return {
         "input_name": person_name,
+        "resolved_to": primary,
+        "alternatives": disambig.get("alternatives", []),
         "recommendations": recommendations,
     }
 
@@ -618,6 +674,10 @@ if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("FINAL RECOMMENDATIONS")
     print("=" * 60)
+    if result.get("resolved_to"):
+        print(f"Searched as: {result['resolved_to']}")
+        if result.get("alternatives"):
+            print(f"Other people with this name: {', '.join(result['alternatives'])}")
     for i, rec in enumerate(result.get("recommendations", []), 1):
         endorsers = ", ".join(rec["endorsers"])
         year = rec.get("year") or "n/a"
