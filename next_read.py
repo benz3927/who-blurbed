@@ -1,12 +1,11 @@
 """
-next-read: blurb-based book recommender (OpenAI version)
+next-read: blurb-based book recommender (OpenAI Responses + web_search)
 
-v3.6:
-- File-based result caching for consistency, speed, and cost.
-- Majority-vote verifier: each (blurber, book) pair is verified N times,
-  and accepted only if >= threshold runs agree. Cached after voting.
-- Configurable via VERIFIER_RUNS and VERIFIER_THRESHOLD.
-- Robust JSON extraction that handles curly quotes and other LLM quirks.
+Strategy for handling search non-determinism:
+- Run the endorsement search N times in parallel for fresh queries
+- Merge unique books across runs (each run finds slightly different things)
+- Cache the merged result — every subsequent user gets the same answer
+- Dedup uses author + title-prefix so subtitle variants collapse to one entry
 """
 
 import json
@@ -23,16 +22,10 @@ load_dotenv()
 client = OpenAI()
 MODEL = "gpt-4.1"
 
-SEARCH_RUNS_PER_VARIANT = 2
-MAX_VARIANTS = 3
-
-# Majority-vote verifier settings.
-# Set VERIFIER_RUNS=1 to disable voting (single run, cheaper).
-VERIFIER_RUNS = 3
-VERIFIER_THRESHOLD = 2  # need >= this many "verified" votes to accept
+RUNS_PER_VARIANT = 3
 
 CACHE_FILE = "cache.json"
-_cache = None  # lazy-loaded
+_cache = None
 
 
 # ============================================================
@@ -59,19 +52,17 @@ def _save_cache():
     try:
         with open(CACHE_FILE, "w") as f:
             json.dump(_cache, f, indent=2)
-    except OSError as e:
-        print(f"  [warning] cache save failed: {e}")
+    except OSError:
+        pass
 
 
 def _cache_key(prefix, *args):
-    """Stable hash key for the given function name + args."""
     payload = json.dumps([prefix, args], sort_keys=True, default=str)
     return hashlib.sha256(payload.encode()).hexdigest()[:32]
 
 
 def _cache_get(prefix, *args):
-    cache = _load_cache()
-    return cache.get(_cache_key(prefix, *args))
+    return _load_cache().get(_cache_key(prefix, *args))
 
 
 def _cache_set(prefix, value, *args):
@@ -81,10 +72,58 @@ def _cache_set(prefix, value, *args):
 
 
 # ============================================================
-# OpenAI call wrapper with retry
+# DEDUP KEY
 # ============================================================
 
-def _call_with_search(prompt, max_output_tokens=3000, max_retries=2):
+def _book_dedup_key(book):
+    """Stable key that collapses subtitle/punctuation/year variants of the same book.
+    
+    e.g. these three become one entry:
+      ("The Fund", "Rob Copeland", 2024)
+      ("The Fund: Ray Dalio, Bridgewater Associates...", "Rob Copeland", 2023)
+      ("the fund.", "rob copeland", None)
+    """
+    title = (book.get("title") or "").lower().strip()
+    # Drop after subtitle separator
+    title = title.split(":")[0].split(" - ")[0].split(" — ")[0]
+    # Strip punctuation, collapse whitespace
+    title = re.sub(r"[^a-z0-9 ]+", "", title)
+    title = re.sub(r"\s+", " ", title).strip()
+    # First ~30 chars is plenty unique without being brittle
+    title = title[:30]
+
+    author = (book.get("author") or "").lower().strip()
+    author = re.sub(r"[^a-z0-9 ]+", "", author)
+    author = re.sub(r"\s+", " ", author).strip()
+    # First author surname when "X and Y" or "X, Y" co-authors
+    author = author.split(" and ")[0].split(",")[0].strip()
+
+    return f"{author}|{title}"
+
+
+def _merge_book_into(books_dict, book):
+    """Add `book` to `books_dict` keyed by dedup key.
+    If a duplicate exists, keep the version with the longer/more detailed title."""
+    key = _book_dedup_key(book)
+    if not key.replace("|", "").strip():
+        return
+    existing = books_dict.get(key)
+    if existing is None:
+        books_dict[key] = book
+        return
+    # Prefer the entry with the longer (more detailed) title
+    if len(book.get("title", "")) > len(existing.get("title", "")):
+        # Preserve fields from existing if new is missing them
+        merged = dict(existing)
+        merged.update({k: v for k, v in book.items() if v})
+        books_dict[key] = merged
+
+
+# ============================================================
+# OpenAI call wrappers
+# ============================================================
+
+def _call_with_search(prompt, max_output_tokens=3000, max_retries=2, temperature=0):
     for attempt in range(max_retries + 1):
         try:
             response = client.responses.create(
@@ -92,6 +131,7 @@ def _call_with_search(prompt, max_output_tokens=3000, max_retries=2):
                 input=prompt,
                 tools=[{"type": "web_search"}],
                 max_output_tokens=max_output_tokens,
+                temperature=temperature,
             )
             text = response.output_text or ""
             if not text:
@@ -109,68 +149,72 @@ def _call_with_search(prompt, max_output_tokens=3000, max_retries=2):
     return ""
 
 
+def _call_plain(prompt, max_output_tokens=400):
+    try:
+        response = client.responses.create(
+            model=MODEL,
+            input=prompt,
+            max_output_tokens=max_output_tokens,
+            temperature=0,
+        )
+        return response.output_text or ""
+    except Exception as e:
+        print(f"  [warning] plain LLM call failed: {e}")
+        return ""
+
+
 # ============================================================
-# NAME VARIANTS (cached)
+# NAME VARIANTS
 # ============================================================
 
 def name_variants(full_name):
-    cached = _cache_get("name_variants", full_name)
+    cached = _cache_get("variants", full_name)
     if cached is not None:
         return cached
-    
+
     prompt = f"""Generate plausible name variants for this person, to be used in a web search for their book endorsements:
 
 "{full_name}"
 
-Return common variations: formal name, nicknames, common shortenings, middle initial variations, etc.
+Return common variations someone might use to refer to the same individual: formal name, nicknames, common shortenings, middle initial variations, etc.
 
 Examples:
 - "Michael Bloomberg" -> ["Michael Bloomberg", "Mike Bloomberg", "Michael R. Bloomberg"]
 - "William Buffett" -> ["William Buffett", "Bill Buffett"]
 - "Robert Iger" -> ["Robert Iger", "Bob Iger"]
 
-Always include the original input first. Return AT MOST 3 variants.
+Include only real, commonly-used variants for this same individual. Always include the original input as the first item.
 
-Return ONLY valid JSON (no other text, no markdown). Use STRAIGHT ASCII quotes only inside JSON strings; never use curly/typographic quotes:
+Return ONLY valid JSON (no other text, no markdown):
 {{"variants": ["Original Name", "Variant 2", "Variant 3"]}}"""
 
-    try:
-        response = client.responses.create(
-            model=MODEL,
-            input=prompt,
-            max_output_tokens=400,
-        )
-        text = response.output_text or ""
-        data = _extract_json(text)
-        variants = data.get("variants", [])
-        if variants:
-            if full_name not in variants:
-                variants = [full_name] + variants
-            seen = set()
-            deduped = []
-            for v in variants:
-                key = v.lower().strip()
-                if key not in seen:
-                    seen.add(key)
-                    deduped.append(v)
-            result = deduped[:MAX_VARIANTS]
-            _cache_set("name_variants", result, full_name)
-            return result
-        return [full_name]
-    except Exception as e:
-        print(f"  [warning] name_variants failed: {e}")
-        return [full_name]
+    text = _call_plain(prompt, max_output_tokens=400)
+    data = _extract_json(text)
+    variants = data.get("variants", [])
+    if variants:
+        if full_name not in variants:
+            variants = [full_name] + variants
+        seen = set()
+        deduped = []
+        for v in variants:
+            key = v.lower().strip()
+            if key not in seen:
+                seen.add(key)
+                deduped.append(v)
+        _cache_set("variants", deduped, full_name)
+        return deduped
+    return [full_name]
 
 
 # ============================================================
-# AGENT 1: BLURBER FINDER (cached)
+# AGENT 1: BLURBER FINDER
 # ============================================================
 
 def blurber_finder_agent(book_title, book_author):
-    cached = _cache_get("blurber_finder", book_title, book_author)
+    cached = _cache_get("blurbers", book_title, book_author)
     if cached is not None:
         return cached
-    
+
     prompt = f"""You are the BLURBER FINDER agent for the next-read app.
 
 Find EVERY real human individual who wrote an endorsement/blurb for this book:
@@ -199,8 +243,7 @@ EXCLUDE:
 - Publisher's own marketing copy
 - The book's own author or co-authors
 
-Return ONLY valid JSON (no other text, no markdown, no trailing commas).
-IMPORTANT: Use STRAIGHT ASCII quotes (") only as JSON delimiters and inside string values. Never use curly typographic quotes ("/" or '/'). If you need to quote text inside a string, paraphrase or escape with backslash:
+Return ONLY valid JSON (no other text, no markdown, no trailing commas):
 {{
   "book_title": "...",
   "book_author": "...",
@@ -212,112 +255,129 @@ IMPORTANT: Use STRAIGHT ASCII quotes (") only as JSON delimiters and inside stri
 Try to find AT LEAST 6-8 blurbers if the book has them."""
     text = _call_with_search(prompt)
     result = _extract_json(text)
-    if result:
-        _cache_set("blurber_finder", result, book_title, book_author)
+    if result.get("blurbers") is not None:
+        _cache_set("blurbers", result, book_title, book_author)
     return result
 
 
 # ============================================================
-# AGENT 2: ENDORSEMENT SEARCH (cached at the merged-result level)
+# AGENT 2: ENDORSEMENT SEARCH
 # ============================================================
 
-def _endorsement_search_single(blurber_name, exclude_book=None):
+def _endorsement_search_one_run(blurber_name, exclude_book, run_idx):
     exclude_clause = f'\nAlso exclude this specific book: "{exclude_book}".' if exclude_book else ""
-    
     prompt = f"""You are the ENDORSEMENT SEARCH agent for the next-read app.
 
-Find books that {blurber_name} (the specific individual person) has personally endorsed for SOMEONE ELSE'S book \u2014 meaning {blurber_name} wrote a blurb, foreword, or introduction for a book authored by another person.{exclude_clause}
+Find books that {blurber_name} (the specific individual person) has personally endorsed for SOMEONE ELSE'S book — meaning {blurber_name} wrote a blurb, foreword, or introduction for a book authored by another person.{exclude_clause}
 
-CRITICAL \u2014 DO NOT INCLUDE:
+CRITICAL — DO NOT INCLUDE:
 - Books AUTHORED or CO-AUTHORED by {blurber_name}
-- Books where {blurber_name} is the subject (biography, memoir target, quote collection)
+- Books where {blurber_name} is the subject
 - Books titled with {blurber_name}'s name
 - Books just because the person works at a related company
 - Books published by an associated company
 - Reviews by their employer's publication
 - Casual mentions in interviews
 
-Example for Michael Bloomberg:
-- INCLUDE: "Principles" by Ray Dalio (Bloomberg blurbed it)
-- EXCLUDE: "Bloomberg by Bloomberg" (he wrote it)
+BE EXHAUSTIVE. Active blurbers have endorsed many books. Do not stop after finding 1-2.
 
-BE EXHAUSTIVE.
-
-Search strategy:
+Search strategy (run multiple searches):
 1. "praise for [book]" attributed to {blurber_name}
 2. "{blurber_name}" wrote foreword for
 3. "{blurber_name}" wrote introduction for
 4. Books with cover blurb by {blurber_name}
-5. Publisher pages quoting {blurber_name}
+5. Publisher pages quoting {blurber_name} about another author's book
+6. Search for {blurber_name}'s name on Amazon book pages in their area of expertise
+7. Recent high-profile nonfiction books in topics {blurber_name} covers (look 2023-2025)
+
+WHAT COUNTS AS AN ENDORSEMENT:
+- Back-cover blurbs / praise quotes attributed by name
+- Forewords or introductions written for someone else's book
+- "Praise for" sections quoting the person
+- Publisher marketing pages quoting their endorsement
 
 Look across the last 15 years.
 
-Return ONLY valid JSON (no other text, no markdown, no trailing commas).
-IMPORTANT: Use STRAIGHT ASCII quotes (") only as JSON delimiters and inside string values. Never use curly typographic quotes ("/" or '/'). If a blurb you want to include contains quotes, paraphrase it or remove the inner quotes:
+Use the EXACT FULL title of the book including any subtitle. Do not abbreviate.
+
+Return ONLY valid JSON (no other text, no markdown, no trailing commas):
 {{
   "endorser": "{blurber_name}",
   "books": [
-    {{"title": "Book Title", "author": "Author Name (must NOT be {blurber_name})", "year": 2023, "one_line": "brief description without inner quotes"}}
+    {{"title": "Full Book Title Including Subtitle", "author": "Author Name (must NOT be {blurber_name})", "year": 2023, "one_line": "brief description"}}
   ]
-}}"""
-    text = _call_with_search(prompt)
+}}
+
+Try hard to find at least 3-5 if the person is a known endorser."""
+    text = _call_with_search(prompt, temperature=0.7)
     return _extract_json(text)
 
 
-def endorsement_search_agent(blurber_name, exclude_book=None):
-    """Cached at the merged-result level."""
-    cached = _cache_get("endorsement_search", blurber_name, exclude_book)
+def _endorsement_search_single_variant(blurber_name, exclude_book):
+    cached = _cache_get("endorse_single_v3", blurber_name, exclude_book or "")
     if cached is not None:
         return cached
-    
-    variants = name_variants(blurber_name)
-    
-    tasks = []
-    for v in variants:
-        for run_idx in range(SEARCH_RUNS_PER_VARIANT):
-            tasks.append((v, run_idx))
-    
+
     all_books = {}
-    
-    with ThreadPoolExecutor(max_workers=6) as executor:
-        future_to_task = {
-            executor.submit(_endorsement_search_single, variant, exclude_book): (variant, run_idx)
-            for variant, run_idx in tasks
-        }
-        for future in as_completed(future_to_task):
-            variant, run_idx = future_to_task[future]
+    with ThreadPoolExecutor(max_workers=RUNS_PER_VARIANT) as ex:
+        futures = [
+            ex.submit(_endorsement_search_one_run, blurber_name, exclude_book, i)
+            for i in range(RUNS_PER_VARIANT)
+        ]
+        for fut in as_completed(futures):
             try:
-                result = future.result()
+                result = fut.result()
                 for book in result.get("books", []):
-                    title = book.get("title", "").strip()
-                    if not title:
+                    if not book.get("title", "").strip():
                         continue
-                    key = title.lower()
-                    if key not in all_books:
-                        all_books[key] = book
+                    _merge_book_into(all_books, book)
             except Exception as e:
-                print(f"  [warning] search failed for variant '{variant}' run {run_idx}: {e}")
-    
-    result = {
+                print(f"  [warning] one of the parallel runs failed: {e}")
+
+    merged = {"endorser": blurber_name, "books": list(all_books.values())}
+    _cache_set("endorse_single_v3", merged, blurber_name, exclude_book or "")
+    return merged
+
+
+def endorsement_search_agent(blurber_name, exclude_book=None):
+    cached = _cache_get("endorse_merged_v3", blurber_name, exclude_book or "")
+    if cached is not None:
+        return cached
+
+    variants = name_variants(blurber_name)
+    all_books = {}
+
+    for variant in variants:
+        try:
+            result = _endorsement_search_single_variant(variant, exclude_book)
+            for book in result.get("books", []):
+                if not book.get("title", "").strip():
+                    continue
+                _merge_book_into(all_books, book)
+        except Exception as e:
+            print(f"  [warning] variant '{variant}' failed: {e}")
+
+    final = {
         "endorser": blurber_name,
         "variants_searched": variants,
-        "runs_per_variant": SEARCH_RUNS_PER_VARIANT,
         "books": list(all_books.values()),
     }
-    if all_books:
-        _cache_set("endorsement_search", result, blurber_name, exclude_book)
-    return result
+    _cache_set("endorse_merged_v3", final, blurber_name, exclude_book or "")
+    return final
 
 
 # ============================================================
-# AGENT 3: VERIFIER (majority-vote, cached)
+# AGENT 3: VERIFIER
 # ============================================================
 
-def _verifier_single(blurber_name, book_title, book_author):
-    """One verifier call. No caching here \u2014 caching happens at the voting layer."""
+def verifier_agent(blurber_name, book_title, book_author):
+    cached = _cache_get("verify", blurber_name, book_title, book_author)
+    if cached is not None:
+        return cached
+
     prompt = f"""You are the VERIFIER agent for the next-read app.
 
-Confirm whether {blurber_name} (the specific individual person) personally endorsed this book, which should be AUTHORED BY SOMEONE ELSE:
+Confirm whether {blurber_name} (the specific individual person, including any common name variants like nicknames) personally endorsed this book, which should be AUTHORED BY SOMEONE ELSE:
 
 Book: "{book_title}" by {book_author}
 
@@ -339,114 +399,60 @@ ACCEPT (verified=true):
 
 REJECT (verified=false):
 - {blurber_name} is the author or co-author
-- Book is about {blurber_name} (biography, memoir, quote collection)
+- Book is about {blurber_name}
 - Book published by a company associated with the person
+- Book's author works for an associated company without separate personal endorsement
 - A publication associated with the person reviewed it
 - Person merely mentioned the book in passing
 
-Return ONLY valid JSON (no other text, no markdown, no trailing commas).
-IMPORTANT: Use STRAIGHT ASCII quotes (") only as JSON delimiters and inside string values. Never use curly typographic quotes ("/" or '/'). If the blurb text you want to include contains quotes, paraphrase or remove the inner quotes:
+Return ONLY valid JSON (no other text, no markdown, no trailing commas):
 {{
   "verified": true,
   "evidence_url": "URL where you found the blurb, or empty",
   "quote": "exact blurb text if found, or empty",
   "reason": "brief explanation"
 }}"""
-    text = _call_with_search(prompt, max_output_tokens=1500)
-    return _extract_json(text)
-
-
-def verifier_agent(blurber_name, book_title, book_author):
-    """
-    Majority-vote verifier. Runs _verifier_single up to VERIFIER_RUNS times in parallel,
-    accepts only if >= VERIFIER_THRESHOLD runs return verified=true.
-    Caches the final aggregated result.
-    """
-    cached = _cache_get("verifier", blurber_name, book_title, book_author)
-    if cached is not None:
-        return cached
-    
-    # Fast path: if voting is disabled, behave like the old single-run verifier.
-    if VERIFIER_RUNS <= 1:
-        result = _verifier_single(blurber_name, book_title, book_author)
-        if result:
-            _cache_set("verifier", result, blurber_name, book_title, book_author)
-        return result
-    
-    results = []
-    with ThreadPoolExecutor(max_workers=VERIFIER_RUNS) as executor:
-        futures = [
-            executor.submit(_verifier_single, blurber_name, book_title, book_author)
-            for _ in range(VERIFIER_RUNS)
-        ]
-        for f in as_completed(futures):
-            try:
-                results.append(f.result())
-            except Exception as e:
-                print(f"  [warning] verifier run failed: {e}")
-                results.append({})
-    
-    votes_yes = sum(1 for r in results if r.get("verified") is True)
-    votes_no = sum(1 for r in results if r.get("verified") is False)
-    verified = votes_yes >= VERIFIER_THRESHOLD
-    
-    # Pick the best evidence: prefer a "verified" run with a real URL + quote.
-    best = None
-    if verified:
-        candidates = [r for r in results if r.get("verified")]
-        # rank: has URL AND quote > has URL > has quote > anything else
-        candidates.sort(
-            key=lambda r: (
-                bool(r.get("evidence_url")) and bool(r.get("quote")),
-                bool(r.get("evidence_url")),
-                bool(r.get("quote")),
-            ),
-            reverse=True,
-        )
-        best = candidates[0] if candidates else {}
-    else:
-        # If rejected, surface the most informative reason.
-        rejections = [r for r in results if r.get("verified") is False and r.get("reason")]
-        best = rejections[0] if rejections else (results[0] if results else {})
-    
+    text = _call_with_search(prompt, max_output_tokens=1500, temperature=0)
+    result = _extract_json(text)
     final = {
-        "verified": verified,
-        "evidence_url": best.get("evidence_url", "") if best else "",
-        "quote": best.get("quote", "") if best else "",
-        "reason": best.get("reason", "") if best else "",
-        "votes": f"{votes_yes}/{VERIFIER_RUNS} verified, {votes_no}/{VERIFIER_RUNS} rejected",
+        "verified": bool(result.get("verified")),
+        "evidence_url": result.get("evidence_url", ""),
+        "quote": result.get("quote", ""),
+        "reason": result.get("reason", ""),
     }
-    _cache_set("verifier", final, blurber_name, book_title, book_author)
+    _cache_set("verify", final, blurber_name, book_title, book_author)
     return final
 
 
 # ============================================================
-# AGENT 4: RANKER (deterministic, no LLM)
+# AGENT 4: RANKER (also uses dedup key for final aggregation)
 # ============================================================
 
 def ranker_agent(verified_endorsements):
-    book_to_endorsers = {}
+    by_key = {}
     for blurber_name, book, v in verified_endorsements:
-        title = book["title"]
-        if title not in book_to_endorsers:
-            book_to_endorsers[title] = {
-                "title": title,
+        key = _book_dedup_key(book)
+        if key not in by_key:
+            by_key[key] = {
+                "title": book["title"],
                 "author": book.get("author", "unknown"),
                 "year": book.get("year"),
                 "one_line": book.get("one_line", ""),
                 "endorsers": [],
                 "evidence": [],
             }
-        if blurber_name not in book_to_endorsers[title]["endorsers"]:
-            book_to_endorsers[title]["endorsers"].append(blurber_name)
-            book_to_endorsers[title]["evidence"].append({
+        # Keep the longest title we've seen for this key
+        if len(book.get("title", "")) > len(by_key[key]["title"]):
+            by_key[key]["title"] = book["title"]
+        if blurber_name not in by_key[key]["endorsers"]:
+            by_key[key]["endorsers"].append(blurber_name)
+            by_key[key]["evidence"].append({
                 "endorser": blurber_name,
                 "url": v.get("evidence_url", ""),
                 "quote": v.get("quote", ""),
-                "votes": v.get("votes", ""),
             })
     return sorted(
-        book_to_endorsers.values(),
+        by_key.values(),
         key=lambda x: (-len(x["endorsers"]), -(x.get("year") or 0)),
     )
 
@@ -466,7 +472,7 @@ def recommend_from_book(book_title, book_author, log=print):
     if not blurbers:
         return {"blurbers": [], "recommendations": []}
 
-    log(f"\n[2/4] Endorsement Search...")
+    log(f"\n[2/4] Endorsement Search ({RUNS_PER_VARIANT} parallel runs per variant)...")
     candidates = []
     with ThreadPoolExecutor(max_workers=4) as executor:
         future_to_name = {
@@ -477,18 +483,18 @@ def recommend_from_book(book_title, book_author, log=print):
             name = future_to_name[future]
             try:
                 result = future.result()
+                variants_used = result.get("variants_searched", [name])
                 count = 0
                 for book in result.get("books", []):
                     if book.get("title", "").strip():
                         candidates.append((name, book))
                         count += 1
-                log(f"  {name}: {count} candidate(s)")
+                log(f"  {name} (variants: {', '.join(variants_used)}): {count} candidate(s)")
             except Exception as e:
                 log(f"  {name}: error - {e}")
-
     log(f"  Total candidates: {len(candidates)}")
 
-    log(f"\n[3/4] Verifier (majority vote: {VERIFIER_THRESHOLD}/{VERIFIER_RUNS})...")
+    log(f"\n[3/4] Verifier: parallel verification...")
     verified = []
     with ThreadPoolExecutor(max_workers=4) as executor:
         future_to_pair = {
@@ -499,18 +505,16 @@ def recommend_from_book(book_title, book_author, log=print):
             name, book = future_to_pair[future]
             try:
                 v = future.result()
-                votes = v.get("votes", "")
                 if v.get("verified"):
-                    log(f"  + {name} -> '{book['title']}' [{votes}]")
+                    log(f"  + {name} -> '{book['title']}'")
                     verified.append((name, book, v))
                 else:
-                    log(f"  - {name} -> '{book['title']}' [{votes}] ({v.get('reason', '')[:60]})")
+                    log(f"  - {name} -> '{book['title']}' ({v.get('reason', '')[:60]})")
             except Exception as e:
                 log(f"  error verifying {name}: {e}")
 
     log(f"\n[4/4] Ranker: aggregating {len(verified)} verified endorsements...")
     recommendations = ranker_agent(verified)
-
     return {
         "input_book": {"title": book_title, "author": book_author},
         "blurbers": blurbers,
@@ -519,18 +523,17 @@ def recommend_from_book(book_title, book_author, log=print):
 
 
 def recommend_from_name(person_name, log=print):
-    log(f"\n[1/3] Endorsement Search: finding everything {person_name} has blurbed...")
+    log(f"\n[1/3] Endorsement Search ({RUNS_PER_VARIANT} parallel runs per variant)...")
     result = endorsement_search_agent(person_name, exclude_book=None)
     variants_used = result.get("variants_searched", [person_name])
-    runs = result.get("runs_per_variant", 1)
-    log(f"  Variants searched: {', '.join(variants_used)} (x{runs} runs each)")
+    log(f"  Variants searched: {', '.join(variants_used)}")
     candidates = []
     for book in result.get("books", []):
         if book.get("title", "").strip():
             candidates.append((person_name, book))
     log(f"  Found {len(candidates)} candidate(s)")
 
-    log(f"\n[2/3] Verifier (majority vote: {VERIFIER_THRESHOLD}/{VERIFIER_RUNS})...")
+    log(f"\n[2/3] Verifier: parallel verification...")
     verified = []
     with ThreadPoolExecutor(max_workers=4) as executor:
         future_to_book = {
@@ -541,18 +544,16 @@ def recommend_from_name(person_name, log=print):
             book = future_to_book[future]
             try:
                 v = future.result()
-                votes = v.get("votes", "")
                 if v.get("verified"):
-                    log(f"  + '{book['title']}' [{votes}]")
+                    log(f"  + '{book['title']}'")
                     verified.append((person_name, book, v))
                 else:
-                    log(f"  - '{book['title']}' [{votes}] ({v.get('reason', '')[:60]})")
+                    log(f"  - '{book['title']}' ({v.get('reason', '')[:60]})")
             except Exception as e:
                 log(f"  error: {e}")
 
     log(f"\n[3/3] Ranker: {len(verified)} verified...")
     recommendations = ranker_agent(verified)
-
     return {
         "input_name": person_name,
         "recommendations": recommendations,
@@ -563,75 +564,37 @@ def recommend_from_name(person_name, log=print):
 # UTILS
 # ============================================================
 
-def _normalize_quotes(s):
-    """Normalize curly typographic quotes to safe straight equivalents.
-    LLMs often emit curly quotes like 'He said "gripping" about it', which
-    breaks JSON parsing because the inner curly quotes look like string
-    delimiters to a naive parser after replacement. We escape them.
-    """
-    # Curly double quotes -> escaped straight double quotes
-    s = s.replace("\u201c", "\\\"").replace("\u201d", "\\\"")
-    # Other double-quote-like characters
-    s = s.replace("\u201f", "\\\"").replace("\u201e", "\\\"")
-    # Curly single quotes -> straight apostrophe
-    s = s.replace("\u2018", "'").replace("\u2019", "'")
-    s = s.replace("\u201a", "'").replace("\u201b", "'")
-    return s
-
-
 def _extract_json(text):
     if not text:
         return {}
-    
-    # Strip markdown code fences
     if "```json" in text:
         text = text.split("```json")[1].split("```")[0]
     elif "```" in text:
         text = text.split("```")[1].split("```")[0]
-    
     start = text.find("{")
     end = text.rfind("}")
     if start == -1 or end == -1:
         return {}
-    
     candidate = text[start:end + 1]
-    
-    # Attempt 1: parse as-is
     try:
         return json.loads(candidate)
     except json.JSONDecodeError:
         pass
-    
-    # Attempt 2: strip trailing commas + control chars
-    cleaned = re.sub(r',\s*([}\]])', r'\1', candidate)
+    cleaned = candidate
+    cleaned = re.sub(r',\s*([}\]])', r'\1', cleaned)
     cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', ' ', cleaned)
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
         pass
-    
-    # Attempt 3: normalize curly quotes (most common LLM JSON failure)
-    requoted = _normalize_quotes(cleaned)
-    try:
-        return json.loads(requoted)
-    except json.JSONDecodeError:
-        pass
-    
-    # Attempt 4: progressively shorter substrings, each tried both raw and requoted
     for end_pos in range(end, start, -1):
         sub = text[start:end_pos + 1]
-        if not sub.endswith("}"):
-            continue
-        try:
-            return json.loads(sub)
-        except json.JSONDecodeError:
-            pass
-        try:
-            return json.loads(_normalize_quotes(sub))
-        except json.JSONDecodeError:
-            continue
-    
-    print(f"  [warning] failed to parse JSON; first 500 chars: {text[:500]}")
+        if sub.endswith("}"):
+            try:
+                return json.loads(sub)
+            except json.JSONDecodeError:
+                continue
+    print(f"  [warning] failed to parse JSON; first 200 chars: {text[:200]}")
     return {}
 
 
@@ -650,10 +613,7 @@ if __name__ == "__main__":
     elif len(sys.argv) >= 3:
         result = recommend_from_book(sys.argv[1], sys.argv[2])
     else:
-        result = recommend_from_book(
-            "Streetwise: Getting to and Through Goldman Sachs",
-            "Lloyd Blankfein",
-        )
+        result = recommend_from_name("Bradley Hope")
 
     print("\n" + "=" * 60)
     print("FINAL RECOMMENDATIONS")
