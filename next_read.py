@@ -270,6 +270,53 @@ Name: {person_name}"""
 # BLURB GATHER — the headline feature, optimized for recall
 # ============================================================
 
+def name_variants(full_name):
+    """Generate plausible name variants — 'Mike Bloomberg' / 'Michael Bloomberg' /
+    'Michael R. Bloomberg' — and run gather on each, merging results. This is the
+    recall multiplier ported from v5 (May 13 version that found Hubris Maximus)."""
+    cached = _cache_get("variants_v1", full_name)
+    if cached is not None:
+        return cached
+
+    prompt = f"""Generate plausible name variants for this person, for web search.
+
+"{full_name}"
+
+If the input has a disambiguator in parens, preserve it across variants so searches stay targeted on the right person.
+
+Return common variations: formal name, nicknames, common shortenings, middle initial variations, etc.
+
+Examples:
+- "Michael Bloomberg" -> ["Michael Bloomberg", "Mike Bloomberg", "Michael R. Bloomberg"]
+- "Ken Griffin (Citadel founder)" -> ["Ken Griffin (Citadel founder)", "Kenneth Griffin (Citadel founder)", "Kenneth C. Griffin (Citadel founder)"]
+- "Bradley Hope (journalist, co-author of 'Billion Dollar Whale')" -> ["Bradley Hope (journalist, co-author of 'Billion Dollar Whale')", "Brad Hope (journalist, co-author of 'Billion Dollar Whale')", "Bradley P. Hope (journalist, co-author of 'Billion Dollar Whale')"]
+
+Include 2–4 real, commonly-used variants. Always include the original input as the first item.
+
+Return ONLY valid JSON (no markdown):
+{{"variants": ["Original Name", "Variant 2", ...]}}"""
+
+    text = _call_plain(prompt, max_output_tokens=400)
+    data = _extract_json(text)
+    variants = data.get("variants", []) if data else []
+    if not variants:
+        return [full_name]
+
+    if full_name not in variants:
+        variants = [full_name] + variants
+
+    seen, deduped = set(), []
+    for v in variants:
+        key = (v or "").lower().strip()
+        if key and key not in seen:
+            seen.add(key)
+            deduped.append(v)
+    # cap at 3 to keep search budget reasonable
+    deduped = deduped[:3]
+    _cache_set("variants_v1", deduped, full_name)
+    return deduped
+
+
 def _gather_blurbs(name, run_idx):
     disambig_match = re.search(r"\(([^)]+)\)", name)
     disambig = disambig_match.group(1) if disambig_match else ""
@@ -419,8 +466,9 @@ If you find none, return empty books array."""
 # ============================================================
 
 def gather_for_mode(name, mode, log=print):
-    """mode is 'blurb' or 'casual'. Caches separately."""
-    cache_prefix = f"gather_v10_5_{mode}"
+    """mode is 'blurb' or 'casual'. Caches separately.
+    Loops over name variants ('Mike'/'Michael') and merges — recall multiplier."""
+    cache_prefix = f"gather_v10_6_{mode}"
     cached = _cache_get(cache_prefix, name)
     if cached is not None:
         log(f"  [cache hit] {cache_prefix} for {name}")
@@ -433,11 +481,17 @@ def gather_for_mode(name, mode, log=print):
         fn = _gather_casual_shares
         runs = CASUAL_RUNS
 
+    variants = name_variants(name)
+    log(f"  Variants to search: {variants}")
+
     all_books = {}
-    log(f"  Running {runs} parallel {mode} gather calls...")
+    # For each variant, kick off `runs` parallel gather calls.
+    tasks = [(v, i) for v in variants for i in range(runs)]
+    log(f"  Running {len(tasks)} parallel {mode} gather calls "
+        f"({len(variants)} variants × {runs} runs)...")
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = [ex.submit(fn, name, i) for i in range(runs)]
+        futures = [ex.submit(fn, v, i) for (v, i) in tasks]
         for fut in as_completed(futures):
             try:
                 result = fut.result()
@@ -448,7 +502,12 @@ def gather_for_mode(name, mode, log=print):
             except Exception as e:
                 log(f"  [warning] {mode} run failed: {e}")
 
-    final = {"endorser": name, "mode": mode, "books": list(all_books.values())}
+    final = {
+        "endorser": name,
+        "mode": mode,
+        "variants_searched": variants,
+        "books": list(all_books.values()),
+    }
     log(f"  Found {len(final['books'])} unique candidates")
 
     if final["books"]:
@@ -461,7 +520,13 @@ def gather_for_mode(name, mode, log=print):
 # ============================================================
 
 def classify_candidate(name, book_title, book_author, mode, prior_signals, prior_source_url=""):
-    cache_prefix = f"classify_v10_{mode}"
+    """Default-accept classifier. Only rejects on three red flags:
+       (a) name is the author/co-author of the book
+       (b) it's a different person with the same name
+       (c) the book is by/about the person (biography, memoir)
+    This is the May 13 v5 philosophy ported into v10 — gather already did
+    the work, classifier should give benefit of the doubt."""
+    cache_prefix = f"classify_v11_{mode}"
     cached = _cache_get(cache_prefix, name, book_title, book_author)
     if cached is not None:
         if not cached.get("source_url") and prior_source_url:
@@ -469,62 +534,55 @@ def classify_candidate(name, book_title, book_author, mode, prior_signals, prior
             cached["source_url"] = _clean_url(prior_source_url)
         return cached
 
-    if mode == "blurb":
-        allowed = "blurb, foreword, introduction, jacket_quote, praise_page"
-        rejection = "not_a_blurb"
-        bar = (
-            "A real BLURB-class endorsement means {name}'s name and quoted words appear "
-            "physically ON or IN the book (back cover, dust jacket, praise page, foreword, "
-            "or introduction). Tweets, blog posts, reading lists, and shareholder letters "
-            "DO NOT count — those are 'not_a_blurb'."
-        ).format(name=name)
-    else:
-        allowed = "tweet, blog_post, substack, instagram, podcast_moment, interview_moment, social_post"
-        rejection = "not_casual"
-        bar = (
-            "A real CASUAL SHARE means {name} personally posted about the book in an "
-            "in-the-moment, informal channel — a tweet, Instagram post, blog post, Substack, "
-            "or a 'just read this' podcast/interview moment. Shareholder letters, formal "
-            "reading lists, biographer compilations, and aggregator listicles DO NOT count "
-            "— those are 'not_casual'. Back-cover blurbs and forewords also DO NOT count "
-            "here — those are a different category."
-        ).format(name=name)
-
-    prior_hint = (
-        f"\nThe gather step tagged this with signal type(s): {', '.join(prior_signals)}."
-        if prior_signals else ""
+    # Default signal type if classifier doesn't return one — trust the gather's tag.
+    default_sig = prior_signals[0] if prior_signals else (
+        "blurb" if mode == "blurb" else "social_post"
     )
 
-    prompt = f"""You are the CLASSIFIER for the next-read app.
+    prompt = f"""You are the VERIFIER for the next-read app, working in {mode.upper()} mode.
 
-A previous gather step found this as a likely match for {name} in {mode.upper()} mode:
+A previous gather step has already found this as a likely match:
 
-Book: "{book_title}" by {book_author}{prior_hint}
+Book: "{book_title}" by {book_author}
+Endorser: {name}
+Prior signal tag(s): {', '.join(prior_signals) if prior_signals else 'unknown'}
 
-{bar}
+Your job is NOT to independently re-prove the endorsement. The gather already did that.
+Your job is ONLY to catch a few specific kinds of false positives.
 
-Determine via quick web search:
+DEFAULT BEHAVIOR: verified=true.
 
-1. signal_type — one of: {allowed}, OR "{rejection}" if it doesn't pass the bar above, OR "unknown" if you can't tell.
+Search the web briefly to check for these RED FLAGS. Set verified=false ONLY if you find clear evidence of one:
 
-2. is_author — is {name} the author/co-author? true / false
+RED FLAG 1: {name} is the AUTHOR or CO-AUTHOR of this book.
+  -> reason: "author of book"
 
-3. same_person_confidence — float 0.0–1.0. If {name} has a disambiguator, how confident are you this is from THAT specific person? No ambiguity → 1.0.
+RED FLAG 2: The endorsement is from a DIFFERENT person with the same name (different Ken Griffin, different Bradley Hope, etc.). Use the disambiguator in {name} to tell which person we mean.
+  -> reason: "different person with same name"
 
-4. source_url — best real https:// URL backing this up. NEVER write prose here, only URLs or empty string.
+RED FLAG 3: The book is BY OR ABOUT {name} (biography of them, memoir by them, book with their name in the title that they didn't blurb).
+  -> reason: "book is by/about the person"
 
-5. quote — exact quoted words from {name} (empty if no quote).
+DO NOT reject just because:
+- You couldn't independently find the blurb online (search results vary)
+- The blurb is hard to verify
+- You aren't 100% sure it's a "formal" blurb in {mode} mode
 
-DEFAULT TO INCLUSION. The gather step already evaluated this; only mark "{rejection}" if you find positive evidence it shouldn't count.
+For {mode} mode, the signal_type should be one of:
+  blurb mode: blurb, foreword, introduction, jacket_quote, praise_page
+  casual mode: tweet, blog_post, substack, instagram, podcast_moment, interview_moment, social_post
+
+If you can't tell, return the prior tag from the gather step.
 
 Return ONLY valid JSON:
 {{
-  "signal_type": "blurb",
+  "verified": true,
+  "signal_type": "{default_sig}",
   "is_author": false,
   "same_person_confidence": 1.0,
-  "source_url": "",
-  "quote": "",
-  "notes": ""
+  "source_url": "URL where you found evidence, or empty",
+  "quote": "exact quoted text if found, or empty",
+  "reason": "brief note, or one of the red flag phrases above"
 }}"""
     text = _call_with_search(prompt, max_output_tokens=1500, temperature=0)
     result = _extract_json(text)
@@ -539,32 +597,42 @@ Return ONLY valid JSON:
         return default
 
     if not result:
+        # Empty response — DEFAULT TO INCLUDE per May 13 philosophy.
+        # Gather already evaluated this candidate.
         final = {
-            "signal_type": prior_signals[0] if prior_signals else "unknown",
+            "verified": True,
+            "signal_type": default_sig,
             "is_author": False,
-            "same_person_confidence": 0.7,
+            "same_person_confidence": 0.8,
             "source_url": _clean_url(prior_source_url),
             "quote": "",
-            "notes": "empty classifier — defaulting to include",
+            "reason": "empty verifier — defaulting to include",
         }
     else:
+        verified = result.get("verified")
+        if verified is None:
+            verified = True  # default-accept
+        else:
+            verified = _to_bool(verified, True)
+
         confidence = result.get("same_person_confidence", 1.0)
         try:
             confidence = float(confidence)
         except (TypeError, ValueError):
-            confidence = 0.7
+            confidence = 0.8
 
-        sig = result.get("signal_type") or (prior_signals[0] if prior_signals else "unknown")
+        sig = result.get("signal_type") or default_sig
         if sig not in KNOWN_SIGNALS:
-            sig = "unknown"
+            sig = default_sig
 
         final = {
+            "verified": verified,
             "signal_type": sig,
             "is_author": _to_bool(result.get("is_author"), False),
             "same_person_confidence": confidence,
             "source_url": _clean_url(result.get("source_url", "")) or _clean_url(prior_source_url),
             "quote": result.get("quote", "") or "",
-            "notes": result.get("notes", "") or "",
+            "reason": result.get("reason", "") or "",
         }
 
     _cache_set(cache_prefix, final, name, book_title, book_author)
@@ -572,27 +640,31 @@ Return ONLY valid JSON:
 
 
 def _should_include(classification, mode):
+    """Default-accept: only reject on the three red flags the verifier checks.
+    Signal-type mismatches are forgiven — gather already filtered for mode."""
+    # Red flag 1
     if classification.get("is_author"):
         return False, "author of book"
+    # Red flag 2
     if classification.get("same_person_confidence", 1.0) < MIN_SAME_PERSON_CONFIDENCE:
         return False, "different person with same name"
+    # Verifier said no (red flag of some kind)
+    if classification.get("verified") is False:
+        return False, classification.get("reason") or "verifier rejected"
 
-    sig = classification.get("signal_type", "unknown")
-    accepted = BLURB_SIGNALS if mode == "blurb" else CASUAL_SIGNALS
+    # Mode-bleed check: blurb mode shouldn't keep tweets, casual mode shouldn't
+    # keep blurbs. Both are rare since gather is mode-specific.
+    sig = classification.get("signal_type", "")
+    if mode == "blurb" and sig in CASUAL_SIGNALS:
+        return False, f"signal_type={sig} (casual signal in blurb mode)"
+    if mode == "casual" and sig in BLURB_SIGNALS:
+        return False, f"signal_type={sig} (blurb signal in casual mode)"
 
-    if sig in accepted:
-        # Casual shares require a source URL — there's no physical book to point to.
-        if mode == "casual" and not classification.get("source_url"):
-            return False, "casual share without source URL"
-        return True, "ok"
+    # Casual mode still requires a source URL — without one there's nothing to point to.
+    if mode == "casual" and not classification.get("source_url"):
+        return False, "casual share without source URL"
 
-    if sig == "unknown":
-        # Unknown only passes if we have a quote AND a URL — strong evidence
-        if classification.get("quote") and classification.get("source_url"):
-            return True, "unknown but with quote+URL"
-        return False, "unknown without quote+URL"
-
-    return False, f"signal_type={sig}"
+    return True, "ok"
 
 
 # ============================================================
