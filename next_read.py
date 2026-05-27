@@ -1,24 +1,30 @@
 """
-next-read v10: blurb-first, with optional casual shares.
+next-read v10.3: blurb-first, with optional casual shares.
+
+CHANGES FROM v10.2:
+  - **Cache merging for gather results.** Each fresh gather run now MERGES
+    its candidates with anything already in the cache for that name+mode,
+    instead of overwriting. This means running the same query multiple times
+    monotonically increases recall — every run adds books, never removes.
+    Fixes the variance problem David flagged on May 7.
+  - BLURB_RUNS bumped from 6 to 10. More parallel searches = better recall
+    per cold run. Cost goes from ~$0.30 to ~$0.50 per uncached query.
+  - New CLI flag --force-refresh wipes only the gather cache for a name,
+    forcing a fresh gather call. Useful when you suspect the cache has
+    stale/incomplete data.
+
+CHANGES FROM v10.1:
+  - Added _is_author_of_book(): deterministic hard filter that catches books
+    where the endorser is the author or co-author. Runs BEFORE the LLM
+    verifier — catches obvious cases for free.
+
+CHANGES FROM v10:
+  - Added telemetry logging (metrics.json).
+  - recommend_from_book now raises NotImplementedError.
 
 David's spec:
-  - PRIMARY: Blurb mode. Physical-book endorsements only — blurb, foreword,
-    introduction, jacket quote, praise page. This is THE product.
-    Optimized for RECALL: don't miss a real blurb. Zero results is fine;
-    we tell the user "this person has not written blurbs for any books, yet."
-  - OPTIONAL: A toggle to ALSO show casual personal shares — tweets, blog
-    posts, Substack, "I just read this" podcast moments. Acts as backup
-    if blurb mode returns empty. NOT shareholder letters, reading lists,
-    biographer appendices, or aggregator listicles.
-
-Two gather modes, two pure signal sets:
-
-  BLURB_SIGNALS = {blurb, foreword, introduction, jacket_quote, praise_page}
-  CASUAL_SIGNALS = {tweet, blog_post, substack, instagram, podcast_moment,
-                    interview_moment}
-
-That's the entire taxonomy. No tiers, no scoring, no "high-confidence" filter.
-The gather prompts are explicit about what counts and what doesn't.
+  - PRIMARY: Blurb mode. Physical-book endorsements only.
+  - OPTIONAL: A toggle to ALSO show casual personal shares.
 """
 
 import json
@@ -27,6 +33,7 @@ import re
 import time
 import hashlib
 import threading
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -37,9 +44,9 @@ client = OpenAI()
 MODEL = "gpt-4.1"
 
 # Recall-first parameters. David's hard constraint: "don't miss a real blurb."
-BLURB_RUNS = 6      # heavy on blurb gather — this is the headline feature
+BLURB_RUNS = 10     # was 6 in v10.2. More parallel searches = better recall.
 CASUAL_RUNS = 3
-MAX_WORKERS = 10
+MAX_WORKERS = 12    # was 10. Modest bump to keep latency similar with more runs.
 
 MIN_SAME_PERSON_CONFIDENCE = 0.5
 
@@ -47,12 +54,60 @@ BLURB_SIGNALS = {"blurb", "foreword", "introduction", "jacket_quote", "praise_pa
 CASUAL_SIGNALS = {"tweet", "blog_post", "substack", "instagram",
                   "podcast_moment", "interview_moment", "social_post"}
 
-# Known tags from anywhere in the system; rogue inventions get dropped.
 KNOWN_SIGNALS = BLURB_SIGNALS | CASUAL_SIGNALS | {"not_a_blurb", "not_casual", "unknown"}
 
 CACHE_FILE = "cache.json"
+METRICS_FILE = "metrics.json"
 _cache = None
 _cache_lock = threading.Lock()
+_metrics_lock = threading.Lock()
+
+
+# ============================================================
+# AUTHOR FILTER
+# ============================================================
+
+def _strip_disambiguator(name):
+    return re.sub(r"\s*\([^)]*\)", "", name or "").strip()
+
+
+def _name_tokens(name):
+    base = _strip_disambiguator(name).lower()
+    base = re.sub(r"\b[a-z]\.\s*", " ", base)
+    tokens = re.split(r"\s+", base.strip())
+    return [t for t in tokens if len(t) > 2]
+
+
+def _is_author_of_book(endorser_name, book_author):
+    """Hard deterministic check: is the endorser the author or co-author?"""
+    if not book_author or not endorser_name:
+        return False
+    endorser_tokens = _name_tokens(endorser_name)
+    if len(endorser_tokens) < 2:
+        return False
+    book_author_lower = (book_author or "").lower()
+    first_name = endorser_tokens[0]
+    last_name = endorser_tokens[-1]
+    if first_name in book_author_lower and last_name in book_author_lower:
+        return True
+    base_full = _strip_disambiguator(endorser_name).lower()
+    if base_full and base_full in book_author_lower:
+        return True
+    return False
+
+
+# ============================================================
+# TELEMETRY
+# ============================================================
+
+def _log_metric(record):
+    record["ts"] = datetime.now(timezone.utc).isoformat()
+    with _metrics_lock:
+        try:
+            with open(METRICS_FILE, "a") as f:
+                f.write(json.dumps(record) + "\n")
+        except OSError as e:
+            print(f"  [warning] failed to write metrics: {e}")
 
 
 # ============================================================
@@ -98,6 +153,18 @@ def _cache_set(prefix, value, *args):
         cache = _load_cache()
         cache[_cache_key(prefix, *args)] = value
         _save_cache_locked()
+
+
+def _cache_delete(prefix, *args):
+    """Wipe a specific cache entry. Used by --force-refresh."""
+    with _cache_lock:
+        cache = _load_cache()
+        key = _cache_key(prefix, *args)
+        if key in cache:
+            del cache[key]
+            _save_cache_locked()
+            return True
+        return False
 
 
 # ============================================================
@@ -267,13 +334,10 @@ Name: {person_name}"""
 
 
 # ============================================================
-# BLURB GATHER — the headline feature, optimized for recall
+# BLURB GATHER
 # ============================================================
 
 def name_variants(full_name):
-    """Generate plausible name variants — 'Mike Bloomberg' / 'Michael Bloomberg' /
-    'Michael R. Bloomberg' — and run gather on each, merging results. This is the
-    recall multiplier ported from v5 (May 13 version that found Hubris Maximus)."""
     cached = _cache_get("variants_v1", full_name)
     if cached is not None:
         return cached
@@ -311,7 +375,6 @@ Return ONLY valid JSON (no markdown):
         if key and key not in seen:
             seen.add(key)
             deduped.append(v)
-    # cap at 3 to keep search budget reasonable
     deduped = deduped[:3]
     _cache_set("variants_v1", deduped, full_name)
     return deduped
@@ -389,10 +452,6 @@ If you find none, return empty books array."""
     return _extract_json(_call_with_search(prompt, temperature=0.7))
 
 
-# ============================================================
-# CASUAL GATHER — the optional fallback
-# ============================================================
-
 def _gather_casual_shares(name, run_idx):
     disambig_match = re.search(r"\(([^)]+)\)", name)
     disambig = disambig_match.group(1) if disambig_match else ""
@@ -462,17 +521,26 @@ If you find none, return empty books array."""
 
 
 # ============================================================
-# GATHER ORCHESTRATION
+# GATHER ORCHESTRATION (MERGED CACHING IN v10.3)
 # ============================================================
 
-def gather_for_mode(name, mode, log=print):
-    """mode is 'blurb' or 'casual'. Caches separately.
-    Loops over name variants ('Mike'/'Michael') and merges — recall multiplier."""
+def gather_for_mode(name, mode, log=print, force_refresh=False):
+    """mode is 'blurb' or 'casual'.
+
+    NEW in v10.3: When a cached result exists, we run a FRESH gather pass
+    and MERGE the new results into the cached set. This means every call
+    monotonically improves recall.
+
+    Set force_refresh=True to wipe cache before this query (still merges
+    after, but starts from empty).
+    """
     cache_prefix = f"gather_v10_6_{mode}"
+
+    if force_refresh:
+        if _cache_delete(cache_prefix, name):
+            log(f"  [cache] wiped {cache_prefix} for {name}")
+
     cached = _cache_get(cache_prefix, name)
-    if cached is not None:
-        log(f"  [cache hit] {cache_prefix} for {name}")
-        return cached
 
     if mode == "blurb":
         fn = _gather_blurbs
@@ -484,8 +552,19 @@ def gather_for_mode(name, mode, log=print):
     variants = name_variants(name)
     log(f"  Variants to search: {variants}")
 
+    # Seed the merge dict from prior cache (if any), then add new findings.
     all_books = {}
-    # For each variant, kick off `runs` parallel gather calls.
+    prior_count = 0
+    if cached:
+        for book in cached.get("books", []):
+            if book.get("title", "").strip():
+                _merge_book_into(all_books, book)
+        prior_count = len(all_books)
+        log(f"  [cache] starting with {prior_count} prior candidates, "
+            f"running fresh gather to find more...")
+    else:
+        log(f"  [cache] no prior cache, running cold gather...")
+
     tasks = [(v, i) for v in variants for i in range(runs)]
     log(f"  Running {len(tasks)} parallel {mode} gather calls "
         f"({len(variants)} variants × {runs} runs)...")
@@ -502,13 +581,23 @@ def gather_for_mode(name, mode, log=print):
             except Exception as e:
                 log(f"  [warning] {mode} run failed: {e}")
 
+    new_count = len(all_books) - prior_count
+    if cached and new_count > 0:
+        log(f"  [cache] added {new_count} new candidates "
+            f"(total now {len(all_books)})")
+    elif cached and new_count == 0:
+        log(f"  [cache] no new candidates this run "
+            f"(still {len(all_books)} total)")
+
     final = {
         "endorser": name,
         "mode": mode,
         "variants_searched": variants,
+        "gather_runs": len(tasks),
         "books": list(all_books.values()),
     }
-    log(f"  Found {len(final['books'])} unique candidates")
+    log(f"  Found {len(final['books'])} unique candidates "
+        f"({prior_count} cached + {new_count} new)")
 
     if final["books"]:
         _cache_set(cache_prefix, final, name)
@@ -516,16 +605,10 @@ def gather_for_mode(name, mode, log=print):
 
 
 # ============================================================
-# CLASSIFY — confirms each candidate against the mode's bar
+# CLASSIFY
 # ============================================================
 
 def classify_candidate(name, book_title, book_author, mode, prior_signals, prior_source_url=""):
-    """Default-accept classifier. Only rejects on three red flags:
-       (a) name is the author/co-author of the book
-       (b) it's a different person with the same name
-       (c) the book is by/about the person (biography, memoir)
-    This is the May 13 v5 philosophy ported into v10 — gather already did
-    the work, classifier should give benefit of the doubt."""
     cache_prefix = f"classify_v11_{mode}"
     cached = _cache_get(cache_prefix, name, book_title, book_author)
     if cached is not None:
@@ -534,7 +617,6 @@ def classify_candidate(name, book_title, book_author, mode, prior_signals, prior
             cached["source_url"] = _clean_url(prior_source_url)
         return cached
 
-    # Default signal type if classifier doesn't return one — trust the gather's tag.
     default_sig = prior_signals[0] if prior_signals else (
         "blurb" if mode == "blurb" else "social_post"
     )
@@ -597,8 +679,6 @@ Return ONLY valid JSON:
         return default
 
     if not result:
-        # Empty response — DEFAULT TO INCLUDE per May 13 philosophy.
-        # Gather already evaluated this candidate.
         final = {
             "verified": True,
             "signal_type": default_sig,
@@ -611,7 +691,7 @@ Return ONLY valid JSON:
     else:
         verified = result.get("verified")
         if verified is None:
-            verified = True  # default-accept
+            verified = True
         else:
             verified = _to_bool(verified, True)
 
@@ -640,30 +720,19 @@ Return ONLY valid JSON:
 
 
 def _should_include(classification, mode):
-    """Default-accept: only reject on the three red flags the verifier checks.
-    Signal-type mismatches are forgiven — gather already filtered for mode."""
-    # Red flag 1
     if classification.get("is_author"):
         return False, "author of book"
-    # Red flag 2
     if classification.get("same_person_confidence", 1.0) < MIN_SAME_PERSON_CONFIDENCE:
         return False, "different person with same name"
-    # Verifier said no (red flag of some kind)
     if classification.get("verified") is False:
         return False, classification.get("reason") or "verifier rejected"
-
-    # Mode-bleed check: blurb mode shouldn't keep tweets, casual mode shouldn't
-    # keep blurbs. Both are rare since gather is mode-specific.
     sig = classification.get("signal_type", "")
     if mode == "blurb" and sig in CASUAL_SIGNALS:
         return False, f"signal_type={sig} (casual signal in blurb mode)"
     if mode == "casual" and sig in BLURB_SIGNALS:
         return False, f"signal_type={sig} (blurb signal in casual mode)"
-
-    # Casual mode still requires a source URL — without one there's nothing to point to.
     if mode == "casual" and not classification.get("source_url"):
         return False, "casual share without source URL"
-
     return True, "ok"
 
 
@@ -711,12 +780,29 @@ def rank(verified):
 # ORCHESTRATOR
 # ============================================================
 
-def _run_mode(primary, mode, log):
+def _run_mode(primary, mode, log, force_refresh=False):
     log(f"\n--- {mode.upper()} MODE ---")
-    result = gather_for_mode(primary, mode, log=log)
-    candidates = [(primary, b) for b in result.get("books", []) if b.get("title", "").strip()]
-    log(f"  Classifying {len(candidates)} candidates...")
+    t0 = time.time()
+
+    result = gather_for_mode(primary, mode, log=log, force_refresh=force_refresh)
+    raw_candidates = [b for b in result.get("books", []) if b.get("title", "").strip()]
+
+    rejection_reasons = {}
+    candidates = []
+    for book in raw_candidates:
+        if _is_author_of_book(primary, book.get("author", "")):
+            log(f"  - '{book['title'][:60]}' (author of book — hard filter)")
+            rejection_reasons["author of book (hard filter)"] = (
+                rejection_reasons.get("author of book (hard filter)", 0) + 1
+            )
+            continue
+        candidates.append((primary, book))
+
+    log(f"  Classifying {len(candidates)} candidates "
+        f"({len(raw_candidates) - len(candidates)} hard-filtered)...")
+
     verified = []
+
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_book = {
             executor.submit(
@@ -740,13 +826,39 @@ def _run_mode(primary, mode, log):
                     verified.append((primary, book, c))
                 else:
                     log(f"  - '{book['title'][:60]}' ({why})")
+                    rejection_reasons[why] = rejection_reasons.get(why, 0) + 1
             except Exception as e:
                 log(f"  error: {e}")
-    return rank(verified)
+                rejection_reasons["classifier exception"] = (
+                    rejection_reasons.get("classifier exception", 0) + 1
+                )
+
+    ranked = rank(verified)
+    duration = round(time.time() - t0, 2)
+
+    metrics = {
+        "mode": mode,
+        "duration_s": duration,
+        "variants_searched": result.get("variants_searched", []),
+        "gather_runs": result.get("gather_runs", 0),
+        "candidates_found": len(raw_candidates),
+        "hard_filtered": len(raw_candidates) - len(candidates),
+        "verified_count": len(verified),
+        "rejected_count": sum(rejection_reasons.values()),
+        "rejection_reasons": rejection_reasons,
+        "final_count": len(ranked),
+    }
+    log(f"  [metrics] {mode} done in {duration}s: "
+        f"{metrics['candidates_found']} candidates -> "
+        f"{metrics['final_count']} final "
+        f"({metrics['hard_filtered']} hard-filtered)")
+
+    return ranked, metrics
 
 
-def recommend_from_name(person_name, include_casual=False, log=print):
+def recommend_from_name(person_name, include_casual=False, log=print, force_refresh=False):
     """Primary: blurb mode. If include_casual=True, also run casual gather as backup."""
+    t_total = time.time()
     log(f"\n[1] Disambiguating '{person_name}'...")
     disambig = disambiguate_person(person_name)
     primary = disambig["primary"]
@@ -754,10 +866,26 @@ def recommend_from_name(person_name, include_casual=False, log=print):
     if disambig.get("alternatives"):
         log(f"  (Other people with this name: {', '.join(disambig['alternatives'])})")
 
-    blurbs = _run_mode(primary, "blurb", log)
-    casual = []
+    blurbs, blurb_metrics = _run_mode(primary, "blurb", log, force_refresh=force_refresh)
+    casual, casual_metrics = [], None
     if include_casual:
-        casual = _run_mode(primary, "casual", log)
+        casual, casual_metrics = _run_mode(primary, "casual", log, force_refresh=force_refresh)
+
+    total_duration = round(time.time() - t_total, 2)
+
+    telemetry_record = {
+        "input_name": person_name,
+        "resolved_to": primary,
+        "is_ambiguous": disambig.get("is_ambiguous", False),
+        "alternatives_count": len(disambig.get("alternatives", [])),
+        "include_casual": include_casual,
+        "force_refresh": force_refresh,
+        "total_duration_s": total_duration,
+        "blurb": blurb_metrics,
+        "casual": casual_metrics,
+    }
+    _log_metric(telemetry_record)
+    log(f"\n[telemetry] logged to {METRICS_FILE} (total {total_duration}s)")
 
     return {
         "input_name": person_name,
@@ -769,14 +897,72 @@ def recommend_from_name(person_name, include_casual=False, log=print):
     }
 
 
-# Back-compat shim for api.py
 def recommend_from_book(book_title, book_author, log=print):
-    log("[info] recommend_from_book disabled in v10 — use /search/endorser")
-    return {
-        "input_book": {"title": book_title, "author": book_author},
-        "blurbers": [],
-        "recommendations": [],
-    }
+    raise NotImplementedError(
+        f"recommend_from_book is disabled in v10. "
+        f"Got call for book='{book_title}' by '{book_author}'. "
+        f"Use recommend_from_name(endorser_name) instead."
+    )
+
+
+# ============================================================
+# METRICS UTILITIES
+# ============================================================
+
+def read_metrics(limit=None):
+    if not os.path.exists(METRICS_FILE):
+        return []
+    records = []
+    try:
+        with open(METRICS_FILE, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        return []
+    records.reverse()
+    if limit:
+        records = records[:limit]
+    return records
+
+
+def metrics_summary():
+    records = read_metrics()
+    if not records:
+        return "No metrics yet."
+
+    total = len(records)
+    avg_total = sum(r.get("total_duration_s", 0) for r in records) / total
+    avg_blurb = sum(r.get("blurb", {}).get("duration_s", 0) for r in records) / total
+    avg_candidates = sum(r.get("blurb", {}).get("candidates_found", 0) for r in records) / total
+    avg_final = sum(r.get("blurb", {}).get("final_count", 0) for r in records) / total
+    avg_hard_filtered = sum(r.get("blurb", {}).get("hard_filtered", 0) for r in records) / total
+    zero_result = sum(1 for r in records if r.get("blurb", {}).get("final_count", 0) == 0)
+
+    all_rejections = {}
+    for r in records:
+        for reason, count in r.get("blurb", {}).get("rejection_reasons", {}).items():
+            all_rejections[reason] = all_rejections.get(reason, 0) + count
+    top_rejections = sorted(all_rejections.items(), key=lambda x: -x[1])[:5]
+
+    lines = [
+        f"Metrics summary ({total} queries):",
+        f"  Avg total latency: {avg_total:.1f}s",
+        f"  Avg blurb latency: {avg_blurb:.1f}s",
+        f"  Avg candidates found: {avg_candidates:.1f}",
+        f"  Avg hard-filtered: {avg_hard_filtered:.1f}",
+        f"  Avg final results: {avg_final:.1f}",
+        f"  Zero-result queries: {zero_result} ({100*zero_result/total:.0f}%)",
+        f"  Top rejection reasons:",
+    ]
+    for reason, count in top_rejections:
+        lines.append(f"    {count}x  {reason}")
+    return "\n".join(lines)
 
 
 # ============================================================
@@ -802,7 +988,6 @@ def _extract_json(text):
     cleaned = candidate
     cleaned = re.sub(r',\s*([}\]])', r'\1', cleaned)
     cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', ' ', cleaned)
-    # Replace bare-word non-keyword values like `"year":unknown`
     cleaned = re.sub(
         r':\s*(?!true\b|false\b|null\b)([A-Za-z_][A-Za-z0-9_/.\-]*)\s*([,}\]])',
         r': null\2',
@@ -813,7 +998,6 @@ def _extract_json(text):
     except json.JSONDecodeError:
         pass
 
-    # Streaming cutoff repair
     try:
         books_match = re.search(r'"books"\s*:\s*\[', cleaned)
         if books_match:
@@ -867,11 +1051,47 @@ if __name__ == "__main__":
         print("ERROR: OPENAI_API_KEY not found in .env")
         sys.exit(1)
 
+    if "--metrics" in sys.argv:
+        print(metrics_summary())
+        sys.exit(0)
+
+    if "--test-author-filter" in sys.argv:
+        test_cases = [
+            ("Bradley Hope (journalist)", "Tom Wright and Bradley Hope", True),
+            ("Bradley Hope (journalist)", "Justin Scheck (and Bradley P. Hope as co-author)", True),
+            ("Bradley Hope (journalist)", "Faiz Siddiqui", False),
+            ("Bradley Hope", "Bradley Hope", True),
+            ("Stephen King", "Owen King", False),
+            ("Stephen King", "Stephen King", True),
+            ("Ken Griffin (Citadel founder)", "Kenneth C. Griffin", True),
+            ("Bono", "Bono", False),
+            ("Yo-Yo Ma (cellist)", "Yo-Yo Ma", True),
+            ("J.K. Rowling", "Robert Galbraith", False),
+        ]
+        print("Testing _is_author_of_book:")
+        all_pass = True
+        for endorser, author, expected in test_cases:
+            got = _is_author_of_book(endorser, author)
+            mark = "✓" if got == expected else "✗"
+            if got != expected:
+                all_pass = False
+            print(f"  {mark}  endorser='{endorser}' author='{author}' "
+                  f"-> got {got}, expected {expected}")
+        print(f"\n{'All tests passed' if all_pass else 'SOME TESTS FAILED'}")
+        sys.exit(0 if all_pass else 1)
+
+    # NEW: --force-refresh wipes the gather cache for this query.
+    force_refresh = "--force-refresh" in sys.argv
     include_casual = "--casual" in sys.argv
-    args = [a for a in sys.argv[1:] if a != "--casual"]
+    args = [a for a in sys.argv[1:]
+            if a not in ("--casual", "--force-refresh")]
     name = args[0] if args else "Bradley Hope"
 
-    result = recommend_from_name(name, include_casual=include_casual)
+    result = recommend_from_name(
+        name,
+        include_casual=include_casual,
+        force_refresh=force_refresh,
+    )
 
     print("\n" + "=" * 60)
     print(f"BLURBS by {result['resolved_to']}")
